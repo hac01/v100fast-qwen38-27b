@@ -1,0 +1,9 @@
+# Build & runtime outputs (never commit!)
+engine/
+models/
+*.gguf
+*.log
+.v100fast.env
+.DS_Store
+__pycache__/
+*.pyc
