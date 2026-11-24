@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Clone pinned llama.cpp (Ajay9o9 DSpine base), apply v100fast Stage 6 patch + sm_70 overlay, and build.
+# Clone pinned llama.cpp (Ajay9o9 DSpine base), apply v100fast Stage 7 patch + sm_70 overlay, and build.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,9 +34,9 @@ else
   fi
 fi
 
-echo "==> Applying Stage 6 tracked-file patch"
-git -C "$SRC_DIR" apply --check "$REPO_DIR/patches/v100fast-stage6.patch"
-git -C "$SRC_DIR" apply "$REPO_DIR/patches/v100fast-stage6.patch"
+echo "==> Applying Stage 7 tracked-file patch"
+git -C "$SRC_DIR" apply --check "$REPO_DIR/patches/v100fast-stage7.patch"
+git -C "$SRC_DIR" apply "$REPO_DIR/patches/v100fast-stage7.patch"
 
 echo "==> Copying sm_70 CUDA kernel overlay"
 cp -a "$REPO_DIR/overlay/." "$SRC_DIR/"
@@ -50,7 +50,7 @@ cmake -S "$SRC_DIR" -B "$BUILD_DIR" \
   -DGGML_CUDA_GRAPHS=ON \
   -DGGML_CUDA_FA=ON \
   -DGGML_CUDA_FA_ALL_QUANTS=OFF \
-  -DGGML_CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;f8_e4m3-f8_e4m3" \
+  -DGGML_CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;f8_e4m3-f8_e4m3" \
   -DLLAMA_BUILD_SERVER=ON \
   -DLLAMA_BUILD_TESTS=ON \
   -DLLAMA_BUILD_TOOLS=ON \

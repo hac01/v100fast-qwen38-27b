@@ -2413,6 +2413,28 @@ static bool q4k_skinny_mul_mat_dispatch(ggml_type type, const uint8_t * codes, c
     }
 }
 
+static half * qskinny_get_f16_input(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+                                    int64_t ne, ggml_cuda_pool_alloc<half> & pool_alloc) {
+    const size_t f16_bytes = (size_t) ne * sizeof(half);
+    if (ctx.curr_stream_no == 0 && ctx.f16_act_buf != nullptr && f16_bytes <= ctx.f16_act_cap) {
+        half * ptr = (half *) ctx.f16_act_buf;
+        if (ctx.f16_act_src != src1->data || ctx.f16_act_ne != ne) {
+            const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+            GGML_ASSERT(to_fp16 != nullptr);
+            to_fp16(src1->data, ptr, ne, ctx.stream());
+            ctx.f16_act_src = src1->data;
+            ctx.f16_act_src_bytes = (size_t) ne * sizeof(float);
+            ctx.f16_act_ne = ne;
+        }
+        return ptr;
+    }
+    pool_alloc.alloc(ne);
+    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+    GGML_ASSERT(to_fp16 != nullptr);
+    to_fp16(src1->data, pool_alloc.get(), ne, ctx.stream());
+    return pool_alloc.get();
+}
+
 bool ggml_cuda_q4k_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                                   const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_q4k_skinny_is_repacked(src0));
@@ -2425,12 +2447,10 @@ bool ggml_cuda_q4k_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_te
         return false;
     }
 
-    ggml_cuda_pool_alloc<half> input(ctx.pool(), m * k);
-    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-    GGML_ASSERT(to_fp16 != nullptr);
-    to_fp16(src1->data, input.get(), m * k, ctx.stream());
+    ggml_cuda_pool_alloc<half> input_pool(ctx.pool());
+    half * input_ptr = qskinny_get_f16_input(ctx, src1, m * k, input_pool);
 
-    return q4k_skinny_mul_mat_dispatch(src0->type, (const uint8_t *) src0->data, input.get(),
+    return q4k_skinny_mul_mat_dispatch(src0->type, (const uint8_t *) src0->data, input_ptr,
                                        (float *) dst->data, (int) n, (int) k, (int) m,
                                        ctx.stream());
 }
@@ -2464,19 +2484,17 @@ bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const g
         return false;
     }
 
-    ggml_cuda_pool_alloc<half> input(ctx.pool(), m * k);
-    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-    GGML_ASSERT(to_fp16 != nullptr);
-    to_fp16(src1->data, input.get(), m * k, ctx.stream());
+    ggml_cuda_pool_alloc<half> input_pool(ctx.pool());
+    half * input_ptr = qskinny_get_f16_input(ctx, src1, m * k, input_pool);
 
     if (m <= 16) {
         if (mixed) {
             return q4k_skinny_gated_mixed_launch(gate_w->type, up_w->type, (const uint8_t *) gate_w->data,
-                                                 (const uint8_t *) up_w->data, input.get(), (float *) dst->data,
+                                                 (const uint8_t *) up_w->data, input_ptr, (float *) dst->data,
                                                  (int) n, (int) k, (int) m, ctx.stream());
         }
         q4k_skinny_gated_mul_mat_launch(gate_w->type, (const uint8_t *) gate_w->data,
-                                        (const uint8_t *) up_w->data, input.get(), (float *) dst->data,
+                                        (const uint8_t *) up_w->data, input_ptr, (float *) dst->data,
                                         (int) n, (int) k, (int) m, ctx.stream());
         return true;
     }
@@ -2485,9 +2503,9 @@ bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const g
     // the same silu formula as the fused kernel
     float * gate = (float *) dst->data;
     ggml_cuda_pool_alloc<float> up(ctx.pool(), n * m);
-    GGML_ASSERT(q4k_skinny_mul_mat_dispatch(gate_w->type, (const uint8_t *) gate_w->data, input.get(), gate,
+    GGML_ASSERT(q4k_skinny_mul_mat_dispatch(gate_w->type, (const uint8_t *) gate_w->data, input_ptr, gate,
                                             (int) n, (int) k, (int) m, ctx.stream()));
-    GGML_ASSERT(q4k_skinny_mul_mat_dispatch(up_w->type, (const uint8_t *) up_w->data, input.get(), up.get(),
+    GGML_ASSERT(q4k_skinny_mul_mat_dispatch(up_w->type, (const uint8_t *) up_w->data, input_ptr, up.get(),
                                             (int) n, (int) k, (int) m, ctx.stream()));
 
     const int count = (int) (n * m);
@@ -2540,11 +2558,9 @@ bool ggml_cuda_q4k_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
         p.n_tiles += p.seg[s].n / 32;
     }
 
-    ggml_cuda_pool_alloc<half> input(ctx.pool(), m * k);
-    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-    GGML_ASSERT(to_fp16 != nullptr);
-    to_fp16(src1->data, input.get(), m * k, ctx.stream());
-    p.input = input.get();
+    ggml_cuda_pool_alloc<half> input_pool(ctx.pool());
+    half * input_ptr = qskinny_get_f16_input(ctx, src1, m * k, input_pool);
+    p.input = input_ptr;
 
     if (m <= 16) {
         q4k_skinny_multi_mul_mat_launch(src0s[0]->type, p, ctx.stream());

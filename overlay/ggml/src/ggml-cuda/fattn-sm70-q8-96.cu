@@ -46,26 +46,6 @@ static __device__ __forceinline__ void softmax_to_half2(half2 (&p)[4], const flo
     p[3] = swap_hi ? s1 : a3;
 }
 
-static __device__ __forceinline__ void dequant8_q4_local(
-        const uint8_t * __restrict__ row_base, int d, uint4 & out_u4) {
-    const uint8_t * blk = row_base + (d >> 5) * 18;
-    const float s = __half2float(*reinterpret_cast<const half *>(blk));
-    const int off = 2 + (d & 15);
-    uint64_t b8 = 0;
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        b8 |= (uint64_t) *reinterpret_cast<const uint16_t *>(blk + off + 2 * k) << (16 * k);
-    }
-    const bool low = (d & 16) == 0;
-    half h[8];
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const uint8_t byte = (uint8_t) ((b8 >> (8 * j)) & 0xFF);
-        const int q = low ? (byte & 0xF) : (byte >> 4);
-        h[j] = __float2half_rn(((float) q - 8.0f) * s);
-    }
-    out_u4 = *reinterpret_cast<const uint4 *>(h);
-}
 
 // Zero-ALU async prefetch structs: NO dependent ALU on loaded words during prefetch!
 struct KvPrefetchF16 {
@@ -81,6 +61,10 @@ struct KvPrefetchQ8 {
 template <int KVMode>
 struct KvPrefetch {
     KvPrefetchF16 f;
+};
+template <>
+struct KvPrefetch<1> {
+    KvPrefetchQ8 q;
 };
 template <>
 struct KvPrefetch<2> {
@@ -125,6 +109,30 @@ static __device__ __forceinline__ void commit_q8_row(
         *reinterpret_cast<const uint32_t *>(&o3));
 }
 
+static __device__ __forceinline__ void commit_q4_row(
+        uint4 * __restrict__ dst_u4, bool q_unal, bool hi_nib,
+        uint16_t sc, uint32_t u0, uint32_t u1, uint32_t u2, const half2 neg1032) {
+    const uint32_t w0 = q_unal ? __byte_perm(u0, u1, 0x5432u) : u0;
+    const uint32_t w1 = q_unal ? __byte_perm(u1, u2, 0x5432u) : u1;
+    const uint32_t n0 = (hi_nib ? (w0 >> 4) : w0) & 0x0F0F0F0Fu;
+    const uint32_t n1 = (hi_nib ? (w1 >> 4) : w1) & 0x0F0F0F0Fu;
+    const half  dh = *reinterpret_cast<const half *>(&sc);
+    const half2 hd = __half2half2(dh);
+    const uint32_t h0 = __byte_perm(n0, 0x00006400u, 0x5150u);
+    const uint32_t h1 = __byte_perm(n0, 0x00006400u, 0x5352u);
+    const uint32_t h2 = __byte_perm(n1, 0x00006400u, 0x5150u);
+    const uint32_t h3 = __byte_perm(n1, 0x00006400u, 0x5352u);
+    const half2 o0 = __hmul2(__hadd2(*reinterpret_cast<const half2 *>(&h0), neg1032), hd);
+    const half2 o1 = __hmul2(__hadd2(*reinterpret_cast<const half2 *>(&h1), neg1032), hd);
+    const half2 o2 = __hmul2(__hadd2(*reinterpret_cast<const half2 *>(&h2), neg1032), hd);
+    const half2 o3 = __hmul2(__hadd2(*reinterpret_cast<const half2 *>(&h3), neg1032), hd);
+    *dst_u4 = make_uint4(
+        *reinterpret_cast<const uint32_t *>(&o0),
+        *reinterpret_cast<const uint32_t *>(&o1),
+        *reinterpret_cast<const uint32_t *>(&o2),
+        *reinterpret_cast<const uint32_t *>(&o3));
+}
+
 template <int KVMode>
 static __device__ __forceinline__ void prefetch_kv_tile(
         KvPrefetch<KVMode> & pf,
@@ -133,8 +141,8 @@ static __device__ __forceinline__ void prefetch_kv_tile(
     const int kl0 = tid >> 5;
     const int d0  = (tid & 31) << 3;
     const bool full = (k_rem >= kBc);
-    if constexpr (KVMode == 2) {
-        const int q_off = 2 + (d0 & 31);
+    if constexpr (KVMode == 2 || KVMode == 1) {
+        const int q_off = (KVMode == 2) ? (2 + (d0 & 31)) : (2 + (d0 & 15));
         const bool q_unal = (((d0 >> 5) & 1) == 0);
         prefetch_q8_row(ptr0,                  q_off, q_unal, full || (kl0      < k_rem), pf.q.s0, pf.q.a0, pf.q.b0, pf.q.c0);
         prefetch_q8_row(ptr0 + 12 * rstride_b, q_off, q_unal, full || (kl0 + 12 < k_rem), pf.q.s1, pf.q.a1, pf.q.b1, pf.q.c1);
@@ -144,8 +152,7 @@ static __device__ __forceinline__ void prefetch_kv_tile(
     } else {
         auto ld1 = [&](const uint8_t * p, bool valid, uint4 & r) {
             if (valid) {
-                if constexpr (KVMode == 1) { dequant8_q4_local(p, d0, r); }
-                else { r = *reinterpret_cast<const uint4 *>(p); }
+                r = *reinterpret_cast<const uint4 *>(p);
             } else { r = make_uint4(0u, 0u, 0u, 0u); }
         };
         ld1(ptr0,                  full || (kl0      < k_rem), pf.f.r0);
@@ -169,6 +176,16 @@ static __device__ __forceinline__ void commit_kv_tile(
         commit_q8_row(dst0 + s12,     q_unal, pf.q.s1, pf.q.a1, pf.q.b1, pf.q.c1, neg1152);
         if (kl0 < 8) {
             commit_q8_row(dst0 + 2 * s12, q_unal, pf.q.s2, pf.q.a2, pf.q.b2, pf.q.c2, neg1152);
+        }
+    } else if constexpr (KVMode == 1) {
+        const unsigned neg1032_bits = 0xE408E408u;
+        const half2 neg1032 = *reinterpret_cast<const half2 *>(&neg1032_bits);
+        const bool q_unal = (((d0 >> 5) & 1) == 0);
+        const bool hi_nib = ((d0 & 16) != 0);
+        commit_q4_row(dst0,           q_unal, hi_nib, pf.q.s0, pf.q.a0, pf.q.b0, pf.q.c0, neg1032);
+        commit_q4_row(dst0 + s12,     q_unal, hi_nib, pf.q.s1, pf.q.a1, pf.q.b1, pf.q.c1, neg1032);
+        if (kl0 < 8) {
+            commit_q4_row(dst0 + 2 * s12, q_unal, hi_nib, pf.q.s2, pf.q.a2, pf.q.b2, pf.q.c2, neg1032);
         }
     } else {
         *dst0 = pf.f.r0;
@@ -256,13 +273,14 @@ __global__ void __launch_bounds__(kThreads, 1) sm70_fa96_decode_kernel(
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
     extern __shared__ char smem_raw[];
     half   * q_s      = reinterpret_cast<half   *>(smem_raw);
-    half   * kv_s     = reinterpret_cast<half   *>(smem_raw + kQBytes);
-    float  * scores_s = reinterpret_cast<float  *>(smem_raw + kQBytes + kKVBytes);
-    uint4  * p_s      = reinterpret_cast<uint4  *>(smem_raw + kQBytes + kKVBytes + kScoresBytes);
-    float2 * stat_s   = reinterpret_cast<float2 *>(smem_raw + kQBytes + kKVBytes + kScoresBytes + kPBytes);
+    half   * k_s      = reinterpret_cast<half   *>(smem_raw + kQBytes);
+    half   * v_s      = reinterpret_cast<half   *>(smem_raw + kQBytes + kKVBytes);
+    float  * scores_s = reinterpret_cast<float  *>(smem_raw + kQBytes + 2 * kKVBytes);
+    uint4  * p_s      = reinterpret_cast<uint4  *>(smem_raw + kQBytes + 2 * kKVBytes + kSumBytes);
+    float2 * stat_s   = reinterpret_cast<float2 *>(smem_raw + kQBytes + 2 * kKVBytes + kSumBytes + kPBytes);
 
     auto score_ptr = [&](int rg, int sub, int j) -> float * {
-        return scores_s + (((rg * 4 + sub) * 8 + j) * 32);
+        return scores_s + (((rg * 4 + sub) * 2 + j) * 32);
     };
     auto p_ptr = [&](int rg, int sub) -> uint4 * {
         return p_s + ((rg * 4 + sub) * 32);
@@ -329,12 +347,13 @@ __global__ void __launch_bounds__(kThreads, 1) sm70_fa96_decode_kernel(
             const int head_q = kv_head * GQA + c;
             const float * src = q + d + (int64_t) token * q_row_stride
                                       + (int64_t) head_q * q_head_stride;
+            const float q_sc = scale * Log2E;
             const float4 v0 = *reinterpret_cast<const float4 *>(src);
             const float4 v1 = *reinterpret_cast<const float4 *>(src + 4);
-            const half2 h0 = __floats2half2_rn(v0.x, v0.y);
-            const half2 h1 = __floats2half2_rn(v0.z, v0.w);
-            const half2 h2 = __floats2half2_rn(v1.x, v1.y);
-            const half2 h3 = __floats2half2_rn(v1.z, v1.w);
+            const half2 h0 = __floats2half2_rn(v0.x * q_sc, v0.y * q_sc);
+            const half2 h1 = __floats2half2_rn(v0.z * q_sc, v0.w * q_sc);
+            const half2 h2 = __floats2half2_rn(v1.x * q_sc, v1.y * q_sc);
+            const half2 h3 = __floats2half2_rn(v1.z * q_sc, v1.w * q_sc);
             *reinterpret_cast<uint4 *>(dst) = make_uint4(
                 *reinterpret_cast<const uint32_t *>(&h0),
                 *reinterpret_cast<const uint32_t *>(&h1),
@@ -362,39 +381,39 @@ __global__ void __launch_bounds__(kThreads, 1) sm70_fa96_decode_kernel(
     const bool r_hi_ok = (row_hi < rows_here);
 
     const half2 * q_rg_h2 = reinterpret_cast<const half2 *>(q_s + rg * 32 * kSmemStride);
-    const half2 * kv_h2   = reinterpret_cast<const half2 *>(kv_s);
+    const half2 * k_h2    = reinterpret_cast<const half2 *>(k_s);
+    const half2 * v_h2    = reinterpret_cast<const half2 *>(v_s);
 
     const int64_t k_rstride_b = (KMode == 0) ? (k_row_stride * (int64_t) sizeof(half)) : k_row_stride;
     const int64_t v_rstride_b = (VMode == 0) ? (v_row_stride * (int64_t) sizeof(half)) : v_row_stride;
     const int d0_init = lane << 3;
-    const int64_t k_extra = (KMode == 2) ? ((d0_init >> 5) * 34) : ((KMode == 0) ? (d0_init * (int64_t) sizeof(half)) : 0);
-    const int64_t v_extra = (VMode == 2) ? ((d0_init >> 5) * 34) : ((VMode == 0) ? (d0_init * (int64_t) sizeof(half)) : 0);
+    const int64_t k_extra = (KMode == 2) ? ((d0_init >> 5) * 34) : ((KMode == 1) ? ((d0_init >> 5) * 18) : (d0_init * (int64_t) sizeof(half)));
+    const int64_t v_extra = (VMode == 2) ? ((d0_init >> 5) * 34) : ((VMode == 1) ? ((d0_init >> 5) * 18) : (d0_init * (int64_t) sizeof(half)));
     const int64_t k_hoff_b = (KMode == 0) ? (k_head_off * (int64_t) sizeof(half)) : k_head_off;
     const int64_t v_hoff_b = (VMode == 0) ? (v_head_off * (int64_t) sizeof(half)) : v_head_off;
     const uint8_t * k_ptr = reinterpret_cast<const uint8_t *>(k) + (int64_t) (k_start + warp) * k_rstride_b + k_hoff_b + k_extra;
     const uint8_t * v_ptr = reinterpret_cast<const uint8_t *>(v) + (int64_t) (k_start + warp) * v_rstride_b + v_hoff_b + v_extra;
 
-    // Prologue: prefetch first K tile while Q stages!
-    KvPrefetch<KMode> pf_k;
+    // Prologue: load first K tile directly into k_s and issue async prefetch of first V tile!
+    KvPrefetch<VMode> pf_v;
     if (k_start < k_end) {
-        prefetch_kv_tile<KMode>(pf_k, k_ptr, k_rstride_b, k_end - k_start, tid);
+        KvPrefetch<KMode> pf_k0;
+        prefetch_kv_tile<KMode>(pf_k0, k_ptr, k_rstride_b, k_end - k_start, tid);
+        commit_kv_tile<KMode>(k_s, pf_k0, tid);
+        prefetch_kv_tile<VMode>(pf_v, v_ptr, v_rstride_b, k_end - k_start, tid);
     }
     __syncthreads();
 
+    // 3-barrier double-buffered k_s / v_s pipeline (down from 4 barriers!) + pre-scaled Q (scale*Log2E)!
     for (int k0 = k_start; k0 < k_end; k0 += kBc) {
         const int k_rem = k_end - k0;
-        // 1) Commit K into kv_s + start zero-ALU async prefetch of V for THIS tile!
-        commit_kv_tile<KMode>(kv_s, pf_k, tid);
-        KvPrefetch<VMode> pf_v;
-        prefetch_kv_tile<VMode>(pf_v, v_ptr, v_rstride_b, k_rem, tid);
-        __syncthreads();
 
-        // 2) QK^T (2x HMMA ILP) -> scale+mask ONCE -> keep my_s[8] in regs + publish sub_max (2 floats) to stat_s!
+        // 1) QK^T (k_s is ready, v_s is idle after prior barrier) -> publish sub_max to stat_s
         float my_s[8];
         if (rows_here > 0) {
             float d0[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
             float d1[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-            const half2 * k_lw_h2 = kv_h2 + lw * 8 * (kSmemStride / 2);
+            const half2 * k_lw_h2 = k_h2 + lw * 8 * (kSmemStride / 2);
 #pragma unroll 4
             for (int c = 0; c < kDChunks; c += 2) {
                 half2 qf0[4], kf0[4], qf1[4], kf1[4];
@@ -412,7 +431,7 @@ __global__ void __launch_bounds__(kThreads, 1) sm70_fa96_decode_kernel(
 #pragma unroll
                 for (int l = 0; l < 8; ++l) {
                     const bool r_ok = ((l & 2) != 0) ? r_hi_ok : r_lo_ok;
-                    my_s[l] = r_ok ? (d0[l] + d1[l]) * scale : -CUDART_INF_F;
+                    my_s[l] = r_ok ? (d0[l] + d1[l]) : -CUDART_INF_F;
                 }
             } else {
 #pragma unroll
@@ -425,9 +444,7 @@ __global__ void __launch_bounds__(kThreads, 1) sm70_fa96_decode_kernel(
                         const int tok = is_hi ? tok_hi : tok_lo;
                         if (MaskMD || key >= kv_offset) {
                             const float mv = __half2float(mask_kv[(int64_t) tok * mask_kv_stride + key]);
-                            val = (mv > -30000.0f) ? (val * scale + mv) : -CUDART_INF_F;
-                        } else {
-                            val *= scale;
+                            val = (mv > -30000.0f) ? (val + mv * Log2E) : -CUDART_INF_F;
                         }
                     } else {
                         val = -CUDART_INF_F;
@@ -441,17 +458,17 @@ __global__ void __launch_bounds__(kThreads, 1) sm70_fa96_decode_kernel(
             sm_hi = fmaxf(sm_hi, __shfl_xor_sync(Full, sm_hi, 2, 32));
             stat_ptr(rg, lw)[lane] = make_float2(sm_lo, sm_hi);
         }
-        __syncthreads();
-
-        // 3) Commit V into kv_s + 4x-split softmax (each warp computes ONLY its 8 exp2f & publishes p_s!)
-        //    + start zero-ALU async prefetch of NEXT tile's K!
-        commit_kv_tile<VMode>(kv_s, pf_v, tid);
+        // Commit V into DISJOINT v_s right after QK^T (overlaps with QK^T tail before barrier #1!)
+        commit_kv_tile<VMode>(v_s, pf_v, tid);
         k_ptr += 32 * k_rstride_b;
         v_ptr += 32 * v_rstride_b;
+        KvPrefetch<KMode> pf_k;
         if (k_rem > kBc) {
             prefetch_kv_tile<KMode>(pf_k, k_ptr, k_rstride_b, k_rem - kBc, tid);
         }
+        __syncthreads();
 
+        // 2) Softmax (reads stat_s, writes p_s & scores_s) + commit NEXT K into DISJOINT k_s + prefetch NEXT V!
         float a_lo = 1.0f, a_hi = 1.0f;
         if (rows_here > 0) {
             const float2 sm0 = stat_ptr(rg, 0)[lane];
@@ -462,23 +479,21 @@ __global__ void __launch_bounds__(kThreads, 1) sm70_fa96_decode_kernel(
             const float bm_hi = fmaxf(fmaxf(sm0.y, sm1.y), fmaxf(sm2.y, sm3.y));
             const float nm_lo = fmaxf(m_lo, bm_lo);
             const float nm_hi = fmaxf(m_hi, bm_hi);
-            a_lo = (m_lo == -CUDART_INF_F) ? 0.0f : ((nm_lo == m_lo) ? 1.0f : exp2f((m_lo - nm_lo) * Log2E));
-            a_hi = (m_hi == -CUDART_INF_F) ? 0.0f : ((nm_hi == m_hi) ? 1.0f : exp2f((m_hi - nm_hi) * Log2E));
+            a_lo = (m_lo == -CUDART_INF_F) ? 0.0f : ((nm_lo == m_lo) ? 1.0f : exp2f(m_lo - nm_lo));
+            a_hi = (m_hi == -CUDART_INF_F) ? 0.0f : ((nm_hi == m_hi) ? 1.0f : exp2f(m_hi - nm_hi));
             m_lo = nm_lo;
             m_hi = nm_hi;
 
-            // Only 8 exp2f + 8 F2F per warp (4x reduction!), keeping my_s[8] in regs (zero scores_s traffic!)
 #pragma unroll
             for (int l = 0; l < 8; ++l) {
                 const float nm = ((l & 2) == 0) ? nm_lo : nm_hi;
                 my_s[l] = (nm > -CUDART_INF_F && my_s[l] > -CUDART_INF_F)
-                              ? exp2f((my_s[l] - nm) * Log2E) : 0.0f;
+                              ? exp2f(my_s[l] - nm) : 0.0f;
             }
             float bl_lo = my_s[0] + my_s[1] + my_s[4] + my_s[5];
             float bl_hi = my_s[2] + my_s[3] + my_s[6] + my_s[7];
             bl_lo += __shfl_xor_sync(Full, bl_lo, 2, 32);
             bl_hi += __shfl_xor_sync(Full, bl_hi, 2, 32);
-            // Store my sub's sum into scores_s[rg][lw][0..1][lane] (disjoint from stat_s!)
             score_ptr(rg, lw, 0)[lane] = bl_lo;
             score_ptr(rg, lw, 1)[lane] = bl_hi;
 
@@ -486,9 +501,13 @@ __global__ void __launch_bounds__(kThreads, 1) sm70_fa96_decode_kernel(
             softmax_to_half2(p_my, my_s);
             p_ptr(rg, lw)[lane] = *reinterpret_cast<const uint4 *>(p_my);
         }
+        if (k_rem > kBc) {
+            commit_kv_tile<KMode>(k_s, pf_k, tid);
+            prefetch_kv_tile<VMode>(pf_v, v_ptr, v_rstride_b, k_rem - kBc, tid);
+        }
         __syncthreads();
 
-        // 4) Direct FP32 PV straight into acc_f (ZERO H2F, 2x HMMA ILP, LDS.128 P + LDS.64 V)!
+        // 3) Direct FP32 PV straight into acc_f (reads v_s, p_s, scores_s — k_s already ready for next tile!)
         if (rows_here > 0) {
             if (lw == 0) {
                 const float bl_lo = score_ptr(rg, 0, 0)[lane] + score_ptr(rg, 1, 0)[lane]
@@ -499,7 +518,6 @@ __global__ void __launch_bounds__(kThreads, 1) sm70_fa96_decode_kernel(
                 l_hi = l_hi * a_hi + bl_hi;
             }
 
-            // Skip ~95% of rescaling FMAs when running max did not change!
             if (a_lo != 1.0f || a_hi != 1.0f) {
 #pragma unroll
                 for (int c = 0; c < kDLocal; ++c) {
@@ -508,7 +526,7 @@ __global__ void __launch_bounds__(kThreads, 1) sm70_fa96_decode_kernel(
                 }
             }
 
-            const half2 * v_slice = kv_h2 + (lw * kDSlice) / 2;
+            const half2 * v_slice = v_h2 + (lw * kDSlice) / 2;
             constexpr int v_sub_stride = 8 * (kSmemStride / 2);
 #pragma unroll
             for (int sub = 0; sub < 4; ++sub) {
@@ -530,14 +548,15 @@ __global__ void __launch_bounds__(kThreads, 1) sm70_fa96_decode_kernel(
         __syncthreads();
     }
 
-    // Write split partials (note: FP32 mma_pv_f32 output uses d_get_i(l) / d_get_j(l) layout!)
+    // Write split partials (convert m from base-2 back to natural log for decode_merge!)
+    constexpr float Ln2 = 0.69314718055994530942f;
     const int rows_pad = hkv * rows_total;
     if (lw == 0 && lane < rows_here) {
         const int token  = (row_base + lane) / GQA;
         const int c      = (row_base + lane) - token * GQA;
         const int row_gl = (kv_head * GQA + c) * q_len + token;
         const int64_t st = (int64_t) split * rows_pad + row_gl;
-        partial_m[st] = ((lane & 2) == 0) ? m_lo : m_hi;
+        partial_m[st] = (((lane & 2) == 0) ? m_lo : m_hi) * Ln2;
         partial_l[st] = ((lane & 2) == 0) ? l_lo : l_hi;
     }
     if (rows_here > 0) {
@@ -635,6 +654,7 @@ void launch_sm70_fa96_decode(
             case 3: go(std::integral_constant<int,1>{}, std::integral_constant<int,0>{}); break;
             case 4: go(std::integral_constant<int,1>{}, std::integral_constant<int,1>{}); break;
             case 6: go(std::integral_constant<int,2>{}, std::integral_constant<int,0>{}); break;
+            case 7: go(std::integral_constant<int,2>{}, std::integral_constant<int,1>{}); break;
             case 8: go(std::integral_constant<int,2>{}, std::integral_constant<int,2>{}); break;
             default: GGML_ABORT("sm70_fa96: unsupported kv_pair %d", kv_pair);
         }

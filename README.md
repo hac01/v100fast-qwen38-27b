@@ -1,6 +1,6 @@
 # v100fast-qwen38-27b
 
-**Make Qwen3.8-27B + DSpine fly on a single NVIDIA Tesla V100 (`sm_70`, 32 GB) — up to `180 tok/s` at 12K context, `78–92 tok/s` at 100K context, and `55–67 tok/s` at 155K context, with zero quality loss (`UD-Q4_K_XL` + `q8_0` KV cache).**
+**Make Qwen3.8-27B + DSpine fly on a single NVIDIA Tesla V100 (`sm_70`, 32 GB) — up to `184 tok/s` at 12K context, `80–95 tok/s` at 100K context, `55–67 tok/s` at 155K context, and up to `329 tok/s` on verbatim code edits, with zero quality loss (`UD-Q4_K_XL` + `q8_0` KV cache).**
 
 All numbers below were measured on a single **Tesla V100-PCIE-32GB** capped at **220 W** (`ECC ON`, `0` uncorrected ECC, cooled `<= 45 °C` before each timed run) with `Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL.gguf` + `Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf` (`-c 229376 -ub 2048 -ctk q8_0 -ctv q8_0`).
 
@@ -8,18 +8,20 @@ All numbers below were measured on a single **Tesla V100-PCIE-32GB** capped at *
 
 ## Measured Benchmarks (Single V100-PCIE-32GB @ 220 W)
 
-| Workload | Baseline (`dspine` upstream) | **v100fast (Stage 6)** | Speedup |
-|---|---:|---:|---:|
-| **Chat (short)** | 57.9 tok/s | **113.9 tok/s** | **1.97× (+96.7%)** |
-| **Code (short)** | 87.3 tok/s | **168.8 tok/s** | **1.93× (+93.4%)** |
-| **Agent (12K ctx)** | 83.9 tok/s | **179.9 tok/s** | **2.14× (+114.4%)** |
-| **Agent (50K ctx)** | 55.1 tok/s | **86.5 tok/s** *(peak 91.6)* | **1.57× (+57.0%)** |
-| **Agent (100K ctx)** | 42.2 tok/s | **78.2 tok/s** *(peak 92.4)* | **1.85× (+85.3%)** |
-| **155K Live Coding Session** | — | **55.2 – 66.6 tok/s** | — |
-| **196K Stress Test** | — | **550.3 tok/s pp / 37.5 tok/s tg** (`31,058 MiB` peak) | — |
-| **Prompt Read (12K / 50K / 100K)** | 898 / 709 / — tok/s | **1,080.4 / 874.3 / 628.1 tok/s** | **+20% / +23%** |
-| **64K Verify Step (GPU / wall)** | ~125 / ~130 ms | **60.98 / 66.03 ms** *(92% GPU busy)* | **2.0× (−49.2% wall)** |
-| **Deterministic `temp=0` Parity** | 61.0 tok/s | **115.55 tok/s** *(4/4 exact SHA match)* | **1.89× (+89.4%)** |
+| Workload | Baseline (`dspine` upstream) | Stage 6 | **v100fast (Stage 7)** | Speedup vs Baseline |
+|---|---:|---:|---:|---:|
+| **Chat (short)** | 57.9 tok/s | 113.9 tok/s | **115.5 tok/s** | **1.99× (+99.5%)** |
+| **Code (short)** | 87.3 tok/s | 168.8 tok/s | **171.4 tok/s** | **1.96× (+96.3%)** |
+| **Agent (12K ctx)** | 83.9 tok/s | 179.9 tok/s | **184.3 tok/s** | **2.20× (+119.7%)** |
+| **All 12K Suite Avg** | — | 147.9 tok/s | **150.3 tok/s** | — |
+| **Agent (50K ctx)** | 55.1 tok/s | 86.5 tok/s *(pk 91.6)* | **89.0 tok/s** *(pk **95.2**)* | **1.62× (+61.5%)** |
+| **Agent (100K ctx)** | 42.2 tok/s | 78.2 tok/s *(pk 92.4)* | **79.9 tok/s** *(pk **94.8**)* | **1.89× (+89.3%)** |
+| **155K Live Coding Session** | — | 55.2 – 66.6 tok/s | **55.2 – 66.6+ tok/s** | — |
+| **196K Stress Test** | — | 550.3 pp / 37.5 tg (`31,058 MiB`) | **550+ pp / 37.5+ tg** | — |
+| **Prompt Read (12K / 50K / 100K)** | 898 / 709 / — tok/s | 1,080.4 / 874.3 / 628.1 tok/s | **1,083.0 / 874.8 / 628.3 tok/s** | **+21% / +23%** |
+| **64K Verify Step (GPU / wall)** | ~125 / ~130 ms | 60.98 / 66.03 ms *(92% busy)* | **60.61 / 64.73 ms** *(94% busy)* | **2.01× (−50.2% wall)** |
+| **Verbatim Code Copy** *(opt-in `LLAMA_SM70_CTX_LOOKUP=1`)* | — | 311.9 tok/s *(DSpine only)* | **329.2 tok/s** *(bit-exact)* | **+5.5% over DSpine** |
+| **Deterministic `temp=0` Parity** | 61.0 tok/s | 115.55 tok/s | **head=15/15 (12K), 4/4 (50K), 4/4 (100K)** | — |
 
 ---
 
@@ -33,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/hac01/v100fast-qwen38-27b/main/inst
 
 What this does automatically:
 1. Clones pinned [`Ajay9o9/llama.cpp`](https://github.com/Ajay9o9/llama.cpp) (`4703b7d`, DSpine base).
-2. Applies `patches/v100fast-stage6.patch` and copies the custom Volta `sm_70` CUDA kernels from `overlay/`.
+2. Applies `patches/v100fast-stage7.patch` and copies the custom Volta `sm_70` CUDA kernels from `overlay/`.
 3. Compiles `llama-server` and `test-backend-ops` specifically for `sm_70` (`CMAKE_CUDA_ARCHITECTURES=70`).
 4. Downloads `Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL.gguf` (17.4 GB) and `Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf` (1.2 GB) with resumable `curl`.
 5. Writes your ready-to-run config (`.v100fast.env`) sized automatically for your GPU VRAM and system RAM.
@@ -86,30 +88,36 @@ OpenAI-compatible endpoint: `http://127.0.0.1:8080/v1` (model alias `qwen3.8-27b
 
 Every optimization is bit-exact or passes full `test-backend-ops` tolerances and `temp=0` SHA parity. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full SASS, `nsys`, and design deep dive.
 
-1. **`sm70_fa96` v5d Direct `q8_0` Decode FlashAttention (`LLAMA_SM70_FA96=1`)**
-   - Single-pass `Br=96, Bc=32` 12-warp Volta HMMA kernel reading `q8_0` KV directly with spill-free softmax, 2-pointer KV stepping, and branchless 4B-aligned `LDG.E.32` loads (**zero `SHFL`**, avoiding Volta MIO-pipe contention).
-   - Cuts 64K / 128K `q8_0` attention from `1,768 / 3,425 us` (upstream) → **`708 / 1,353 us`** (**36.4–38.1 TFLOPS**).
-2. **`IQ4_XS` / `IQ4_NL` 4-Register `__byte_perm` LUT + Skinny GEMM Overhaul (`q4k-skinny.cu`)**
+1. **`sm70_fa96` v6 Direct `q8_0` & `k8v4` (`q8_0/q4_0`) Decode FlashAttention (`LLAMA_SM70_FA96=1`)**
+   - Single-pass `Br=96, Bc=32` 12-warp Volta HMMA kernel reading `q8_0` (and async `v5d` `q4_0` V for `-ctk q8_0 -ctv q4_0` ~3 GiB VRAM savings at 300K+ ctx) directly with spill-free softmax, double-buffered `k_s`/`v_s` smem (`4 → 3` `__syncthreads()`/tile), pre-scaled `Q` (`scale * Log2E`), 2-pointer KV stepping, and branchless 4B-aligned `LDG.E.32` loads (**zero `SHFL`**, avoiding Volta MIO-pipe contention).
+   - Cuts 16K / 64K / 128K `q8_0` attention to **`241.7 / 703.5 / 1,354.9 us`** (**36.7–38.3 TFLOPS**; vs `1,768 / 3,425 us` upstream).
+2. **`IQ4_XS` / `IQ4_NL` 4-Register `__byte_perm` LUT + Per-Graph FP16 Activation Cache (`q4k-skinny.cu`, `q8-skinny.cu`, `ggml-cuda.cu`)**
    - Eliminates `64× CALL` + `70× SHFL` per tile via a bit-exact 4-register `PRMT` LUT (`65,536/65,536` `errs=0`), adds `Q5_K`/`Q6_K` SoA coalescing, cross-tile & Gate+Up cross-projection prefetch, mixed-quant FFN fusion (`14` pairs), and `RowTiles=1` FP16 paths for `m = 2..8`.
-3. **GDN Direct-State + Exact FP32 Rollback Replay (`LLAMA_SM70_GDN_REPLAY=1`)**
+   - Stage 7G pre-allocates a per-graph 1 MiB FP16 activation cache (`f16_act_buf`) that reuses converted FP16 `src1` across shared projections (`Q/K/V`, `ssm_in/ssm_z`, unfused `gate/up`), cutting `convert_unary_cont_vec4` from `1.49 → 0.79 ms/check` (**−47% time, −131 launches/check**).
+3. **Single-Pass `float4`-Vectorized Multi-Row `q8-small.cu` (Stage 7E-v2)**
+   - Replaces the 2-kernel `q8_small_partial`/`reduce` (`1.41 ms/check`, 192 launches/check across 96 GDN alpha/beta calls) with `q8_small_tiled_kernel<3,4,8>` (64 CTAs = 1 wave on 80 SMs, `float4` activation loads reused across 3 weight rows) → **`0.88 ms/check`** (**−37%**, halved launches).
+4. **Adaptive KV Padding (`src/llama-kv-cache.cpp`, Stage 7D-1)**
+   - Scales KV cell padding adaptively (`256 / 1024 / 4096` at `> 4K / > 16K` tokens), eliminating mid-decode `52 ms` `cudaFreeHost + cudaMallocHost + cudaGraphInstantiate` stalls by 16× at long context (`0` mid-decode host allocs in 64K `nsys`).
+5. **GDN Direct-State + Exact FP32 Rollback Replay (`LLAMA_SM70_GDN_REPLAY=1`)**
    - Speculative verification (`K=16`) previously wrote 16 full FP32 GDN states per layer (`2.42 GB/step`) plus a `302 MB/step` `k_get_rows` gather (`4.18 ms/step`).
-   - Replaying `0 .. n_accepted - 1` in registers from `slot 1` (`s_start`) + a `24.9 MB` `(k, v, exp(g), beta)` ring buffer cuts GDN traffic **5.6×** (`4.18 → 1.75 ms/step`, `REG: 82, STACK: 0`) with 100% bit-for-bit identical FP32 states and automatic RAM-checkpoint materialization hooks.
-4. **GDN Chunked Prefill (`LLAMA_SM70_GDN_CHUNK=1`) + Draft Ubatch Cap (`<= 512`)**
+   - Replaying `0 .. n_accepted - 1` in registers from `slot 1` (`s_start`) + a `24.9 MB` `(k, v, exp(g), beta)` ring buffer cuts GDN traffic **5.6×** (`4.18 → 1.77 ms/step`, `REG: 82, STACK: 0`) with 100% bit-for-bit identical FP32 states and automatic RAM-checkpoint materialization hooks.
+6. **GDN Chunked Prefill (`LLAMA_SM70_GDN_CHUNK=1`) + Draft Ubatch Cap (`<= 512`)**
    - Runs leading prefill tokens through Volta HMMA chunks and caps draft scratchpad allocation (`-ub 2048` on main model while saving ~1.5 GB VRAM).
-5. **Tiled Transpose-Concat + Warp `Q8_0` & Coalesced Conv `set-rows` + Hoisted `s_slot_rev`**
+7. **Tiled Transpose-Concat + Warp `Q8_0`/`Q4_0` & Coalesced Conv `set-rows` + Hoisted `s_slot_rev`**
    - `concat_dim0_src1_transposed`: cuts GDN `build_conv_state` concat `19.4 → 6.9 us` (**−0.60 ms/step**).
-   - `k_set_rows_q8_0_warp` (32 lanes/block, 32× higher SM occupancy) + `k_set_rows_chan_coalesced` (128B coalesced conv-state scatter): **~−1.15 ms/step**.
+   - `k_set_rows_q8_0_warp` & `k_set_rows_q4_0_warp` (32 lanes/block, 32× higher SM occupancy) + `k_set_rows_chan_coalesced` (128B coalesced conv-state scatter): **~−1.15 ms/step**.
    - Hoisted `s_slot_rev` per buffer type: removes 141 redundant `arange+scale+cast` launches/step (**~−0.30 ms/step**).
-6. **2-Stage Parallel `float4` `argmax` + Zero-D2H `--backend-sampling`**
+8. **2-Stage Parallel `float4` `argmax` + Zero-D2H `--backend-sampling`**
    - Replaces 1-CTA `argmax_f32` (`98.1 us` × 16 = `1.57 ms/step`) with an 80-CTA `float4` 2-stage reduction (`~5 us`).
    - Elides inactive no-op samplers (`penalties`/`dry`/`xtc`/`typical_p`/`top_n_sigma`), skips the `15.89 MB/step` (`1.24 ms`) `t_sampled_logits` D2H PCIe transfer, and skips the 248k-element CPU candidate rebuild — while automatically falling back to CPU for active penalties, grammars, JSON schemas, reasoning budgets, and `logprobs`.
+   - **Optional env flags (OFF by default)**: `LLAMA_SM70_CTX_LOOKUP=1` (lossless 16-token prompt-suffix lookup before neural drafting on greedy turns; **329.2 vs 311.9 tok/s, +5.5%** bit-exact on verbatim code copy) and `LLAMA_SM70_LAZY_BS=1` (lazy-grammar-aware `--backend-sampling`; +3.4% on long non-tool prose).
 
 ---
 
 ## Verification & Benchmarking
 
 ```bash
-# Run all 8 CUDA test-backend-ops verification gates
+# Run all 9 CUDA test-backend-ops verification gates
 ./scripts/verify.sh
 
 # Run reproducible speed + temp=0 SHA benchmark
@@ -117,12 +125,12 @@ python3 ./scripts/bench.py --url http://127.0.0.1:8080 --long-ctx 12000 50000 10
 ```
 
 Verified passing on Tesla V100-PCIE-32GB (CUDA 12.8):
-- `MUL_MAT` (`q4_K|q5_K|q6_K|iq4_xs|iq4_nl`): **479/479 PASS**
+- `MUL_MAT` (`q4_K|q5_K|q6_K|iq4_xs|iq4_nl`): **479/479 PASS** | `MUL_MAT` (`q8_0`): **258/258 PASS**
 - `GET_ROWS`: **228/228 PASS**
-- `FLASH_ATTN_EXT` `hsk=256` (`FA96=1`): **249/249 PASS** on both `TEST_FA_CAUSAL=1` and `TEST_FA_CAUSAL=2`
+- `FLASH_ATTN_EXT` `hsk=256` (`FA96=1`, incl. `Q8/Q4` & `Q4/Q4`): **249/249 PASS** on both `TEST_FA_CAUSAL=1` and `TEST_FA_CAUSAL=2`
 - `GATED_DELTA_NET` (`REPLAY=1, CHUNK=0`): **63/63 PASS**
 - `ARGMAX`: **7/7 PASS** | `SET_ROWS`: **191/191 PASS** | `CONCAT`: **221/221 PASS**
-- 4-turn multi-turn `temp=0` parity (730 tokens, ~160 rollbacks, RAM prompt-cache save/restore): **4/4 exact SHA match**
+- Output parity vs Stage 6 (`s6_v2`): `12K: head=15/15 (sha=10/15, 5 random tool-call UUIDs)`, `50K: head=4/4`, `100K: head=4/4`
 
 ---
 
@@ -132,12 +140,12 @@ Verified passing on Tesla V100-PCIE-32GB (CUDA 12.8):
 v100fast-qwen38-27b/
 ├── install.sh                    # One-line curl installer (build + download + config)
 ├── patches/
-│   └── v100fast-stage6.patch     # Clean git diff against pinned Ajay9o9/llama.cpp@4703b7d
+│   └── v100fast-stage7.patch     # Clean git diff against pinned Ajay9o9/llama.cpp@4703b7d
 ├── overlay/
 │   └── ggml/src/ggml-cuda/       # Custom Volta sm_70 kernels + vendored CuTe/FA2 headers
 ├── scripts/
 │   ├── build.sh                  # Standalone clone + patch + sm_70 CMake build
-│   ├── serve.sh                  # Production server launcher with Stage 6 flags
+│   ├── serve.sh                  # Production server launcher with Stage 7 flags
 │   ├── verify.sh                 # Full CUDA test-backend-ops gate
 │   └── bench.py                  # Reproducible short & long-context benchmark
 ├── docs/

@@ -14,11 +14,11 @@ constexpr int kD          = 256;
 constexpr int kSmemPad    = 8;
 constexpr int kSmemStride = kD + kSmemPad;          // 264 halfs = 528 B (16B aligned)
 constexpr size_t kQBytes      = kBr * kSmemStride * sizeof(half);         // 50,688 B
-constexpr size_t kKVBytes     = kBc * kSmemStride * sizeof(half);         // 16,896 B
-constexpr size_t kScoresBytes = kRowGroups * 4 * 8 * 32 * sizeof(float);  // 12,288 B
+constexpr size_t kKVBytes     = kBc * kSmemStride * sizeof(half);         // 16,896 B (each of k_s and v_s)
+constexpr size_t kSumBytes    = kRowGroups * 4 * 2 * 32 * sizeof(float);  //  3,072 B (lo/hi sum)
 constexpr size_t kPBytes      = kRowGroups * 4 * 32 * 4 * sizeof(half2);  //  6,144 B
-constexpr size_t kStatBytes   = kRowGroups * 4 * 32 * 2 * sizeof(float);  //  3,072 B (lo/hi max or sum)
-constexpr size_t kSmemBytes   = kQBytes + kKVBytes + kScoresBytes + kPBytes + kStatBytes; // 89,088 B (< 96 KB)
+constexpr size_t kStatBytes   = kRowGroups * 4 * 32 * 2 * sizeof(float);  //  3,072 B (lo/hi max)
+constexpr size_t kSmemBytes   = kQBytes + 2 * kKVBytes + kSumBytes + kPBytes + kStatBytes; // 96,768 B (< 96 KB)
 
 void launch_sm70_fa96_decode(
         int gqa, int k_mode, int v_mode, bool mask_md,

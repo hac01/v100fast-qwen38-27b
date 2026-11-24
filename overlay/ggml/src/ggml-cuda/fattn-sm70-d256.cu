@@ -430,7 +430,8 @@ static int sm70_d256_dec_split_cap(int hkv) {
 static bool sm70_d256_dec_q4_direct() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_SM70_D256_DEC_Q4");
-        return e && e[0] == '1';
+        if (e != nullptr) { return e[0] != '0'; }
+        return sm70_fa96_enabled();
     }();
     return on;
 }
@@ -531,7 +532,7 @@ static void ggml_cuda_flash_attn_ext_sm70_d256_decode(ggml_backend_cuda_context 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
     int k_mode = sm70_d256_dec_kv_mode(K);
     int v_mode = sm70_d256_dec_kv_mode(V);
-    if ((k_mode == 1 && v_mode == 2) || (k_mode == 2 && v_mode == 1)) { v_mode = 0; }
+    if ((k_mode == 1 && v_mode == 2) || (k_mode == 2 && v_mode == 1 && !sm70_fa96_enabled())) { v_mode = 0; }
     const bool k_direct = (k_mode != 0);
     const bool v_direct = (v_mode != 0);
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
@@ -580,41 +581,43 @@ static void ggml_cuda_flash_attn_ext_sm70_d256_decode(ggml_backend_cuda_context 
     const bool mask_md_dec = sm70_maskmd(K, V, mask);
     // Always pass mask_kv so non-MaskMD mode can check exact mask on tail tokens (DSpine bidirectional blocks)
     const half * mask_kv = (const half *) mask->data;
-    auto launch = [&](auto km, auto vm, auto mm) {
-        constexpr int KM = decltype(km)::value;
-        constexpr int VM = decltype(vm)::value;
-        constexpr bool MM = decltype(mm)::value;
-        if (use_fa96) {
-            sm70_fa96::launch_sm70_fa96_decode(gqa, k_mode, v_mode, mask_md_dec, grid, stream,
-                (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
-                q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l,
-                mask_kv, mask_kv_stride);
-        } else if (gqa == 6) {
-            sm70_d256_decode::sm70_d256_decode_kernel<6, KM, VM, MM><<<grid, 128, 0, stream>>>(
-                (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
-                q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l,
-                mask_kv, mask_kv_stride);
-        } else {
-            sm70_d256_decode::sm70_d256_decode_kernel<8, KM, VM, MM><<<grid, 128, 0, stream>>>(
-                (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
-                q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l,
-                mask_kv, mask_kv_stride);
-        }
-    };
-    auto launch_kv = [&](auto mm) {
-        const int kv_pair = k_mode * 3 + v_mode;
-        switch (kv_pair) {
-            case 0: launch(std::integral_constant<int,0>{}, std::integral_constant<int,0>{}, mm); break;
-            case 1: launch(std::integral_constant<int,0>{}, std::integral_constant<int,1>{}, mm); break;
-            case 2: launch(std::integral_constant<int,0>{}, std::integral_constant<int,2>{}, mm); break;
-            case 3: launch(std::integral_constant<int,1>{}, std::integral_constant<int,0>{}, mm); break;
-            case 4: launch(std::integral_constant<int,1>{}, std::integral_constant<int,1>{}, mm); break;
-            case 6: launch(std::integral_constant<int,2>{}, std::integral_constant<int,0>{}, mm); break;
-            case 8: launch(std::integral_constant<int,2>{}, std::integral_constant<int,2>{}, mm); break;
-            default: GGML_ABORT("sm70_d256_decode: unsupported kv_pair %d", kv_pair);
-        }
-    };
-    if (mask_md_dec) { launch_kv(std::true_type{}); } else { launch_kv(std::false_type{}); }
+    if (use_fa96) {
+        sm70_fa96::launch_sm70_fa96_decode(gqa, k_mode, v_mode, mask_md_dec, grid, stream,
+            (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
+            q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l,
+            mask_kv, mask_kv_stride);
+    } else {
+        auto launch = [&](auto km, auto vm, auto mm) {
+            constexpr int KM = decltype(km)::value;
+            constexpr int VM = decltype(vm)::value;
+            constexpr bool MM = decltype(mm)::value;
+            if (gqa == 6) {
+                sm70_d256_decode::sm70_d256_decode_kernel<6, KM, VM, MM><<<grid, 128, 0, stream>>>(
+                    (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
+                    q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l,
+                    mask_kv, mask_kv_stride);
+            } else {
+                sm70_d256_decode::sm70_d256_decode_kernel<8, KM, VM, MM><<<grid, 128, 0, stream>>>(
+                    (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
+                    q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l,
+                    mask_kv, mask_kv_stride);
+            }
+        };
+        auto launch_kv = [&](auto mm) {
+            const int kv_pair = k_mode * 3 + v_mode;
+            switch (kv_pair) {
+                case 0: launch(std::integral_constant<int,0>{}, std::integral_constant<int,0>{}, mm); break;
+                case 1: launch(std::integral_constant<int,0>{}, std::integral_constant<int,1>{}, mm); break;
+                case 2: launch(std::integral_constant<int,0>{}, std::integral_constant<int,2>{}, mm); break;
+                case 3: launch(std::integral_constant<int,1>{}, std::integral_constant<int,0>{}, mm); break;
+                case 4: launch(std::integral_constant<int,1>{}, std::integral_constant<int,1>{}, mm); break;
+                case 6: launch(std::integral_constant<int,2>{}, std::integral_constant<int,0>{}, mm); break;
+                case 8: launch(std::integral_constant<int,2>{}, std::integral_constant<int,2>{}, mm); break;
+                default: GGML_ABORT("sm70_d256_decode: unsupported kv_pair %d", kv_pair);
+            }
+        };
+        if (mask_md_dec) { launch_kv(std::true_type{}); } else { launch_kv(std::false_type{}); }
+    }
     CUDA_CHECK(cudaGetLastError());
     {
         static bool once = [] { return getenv("LLAMA_SM70_D256_DEBUG") != nullptr; }();
@@ -809,7 +812,7 @@ size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
             const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
             int km_a = sm70_d256_dec_kv_mode(K);
             int vm_a = sm70_d256_dec_kv_mode(V);
-            if ((km_a == 1 && vm_a == 2) || (km_a == 2 && vm_a == 1)) { vm_a = 0; }
+            if ((km_a == 1 && vm_a == 2) || (km_a == 2 && vm_a == 1 && !sm70_fa96_enabled())) { vm_a = 0; }
             const bool k_dir = (km_a != 0);
             const bool v_dir = (vm_a != 0);
             const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =

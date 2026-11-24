@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch Qwen3.8-27B + DSpine on Tesla V100-PCIE-32GB with all verified Stage 6 optimizations.
+# Launch Qwen3.8-27B + DSpine on Tesla V100-PCIE-32GB with all verified Stage 7 optimizations.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,7 +77,7 @@ if [ "${PL:-0}" -gt 0 ] && command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 
-# Stage 6 Volta sm_70 kernel flags (all verified 100% bit-exact)
+# Stage 7 Volta sm_70 kernel flags (all verified 100% bit-exact)
 export LLAMA_SM70_FA96=1
 export LLAMA_SM70_GDN_CHUNK=1
 export LLAMA_SM70_GDN_REPLAY=1

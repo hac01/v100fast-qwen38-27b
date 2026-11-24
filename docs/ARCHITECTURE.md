@@ -1,6 +1,6 @@
 # Architecture & Volta (`sm_70`) Optimization Deep Dive
 
-This document explains why **Qwen3.8-27B + DSpine** runs **~2.0× faster** on a single Tesla V100-PCIE-32GB (`sm_70`, 220 W, `q8_0` KV) with `v100fast` Stage 6, including the `cuobjdump -sass` and `nsys` findings that drove every optimization — and the experiments we tested and reverted.
+This document explains why **Qwen3.8-27B + DSpine** runs **~2.0–2.2× faster** on a single Tesla V100-PCIE-32GB (`sm_70`, 220 W, `q8_0` KV) with `v100fast` Stage 7, including the `cuobjdump -sass` and `nsys` findings that drove every optimization — and the experiments we tested and reverted or left opt-in OFF.
 
 ---
 
@@ -23,7 +23,8 @@ Measured via `nsys --cuda-graph-trace=node` at 64K context (`n_draft = 15`, 16-t
 | Stage 4–5b | 75.51 ms | 83.94 ms | ~89% | `sm70_fa96` v4, `Q5_K`/`Q6_K` SoA, mixed FFN fusion, GDN chunk prefill, draft `ub <= 512` |
 | Stage 6 (`s6c_clean`) | 65.71 ms | 72.51 ms | 90.6% | `IQ4_XS` 4-reg PRMT LUT, Gate+Up prefetch, `m=2..8` FP16 skinny, **`sm70_fa96` v5d** |
 | Stage 6 (`s6e_replay`) | 62.68 ms | 69.73 ms | 90.0% | **GDN direct-state + exact FP32 rollback replay** (`4.18 → 1.81 ms/check`) |
-| **Stage 6 Final (`s6_v2`)** | **60.98 ms** | **66.03 ms** | **92.4%** | Tiled transpose-concat + warp `Q8_0` & coalesced conv `set-rows` + hoisted `s_slot_rev` + parallel `argmax` + zero-D2H `--backend-sampling` |
+| Stage 6 Final (`s6_v2`) | 60.98 ms | 66.03 ms | 92.4% | Tiled transpose-concat + warp `Q8_0` & coalesced conv `set-rows` + hoisted `s_slot_rev` + parallel `argmax` + zero-D2H `--backend-sampling` |
+| **Stage 7 Final (`s7v2`)** | **60.61 ms** | **64.73 ms** | **94.0%** | **Per-graph FP16 activation cache (`convert` −47%) + `float4` tiled multi-row `q8-small` (−37%) + `sm70_fa96 v6` double-buffered smem + adaptive KV padding (`0` mid-decode `cudaMallocHost` stalls) + `k8v4` `Q4_0` V** |
 
 ---
 
@@ -77,12 +78,21 @@ Measured via `nsys --cuda-graph-trace=node` at 64K context (`n_draft = 15`, 16-t
   - `llama-context.cpp`: Skip D2H copy of `t_sampled_logits` / `t_candidates` on rows where `t_sampled[i] != nullptr && t_sampled_probs[i] == nullptr`.
 - **Result**: D2H logits transfer dropped from **`15.89 MB → 0 bytes`**, lifting `GPU busy` to **92.4%** and jumping Chat/Code/12K by **+7–10%** while tying `temp=0.7` and preserving automatic CPU fallback for active penalties, grammars, JSON schemas, reasoning budgets, and `logprobs`.
 
+### 3.7 Stage 7 Optimizations (`q8-small.cu`, `ggml-cuda.cu`, `fattn-sm70-q8-96.cu`, `llama-kv-cache.cpp`, `set-rows.cu`)
+- **Stage 7G — Per-Graph FP16 Activation Cache (`common.cuh`, `ggml-cuda.cu`, `q4k-skinny.cu`, `q8-skinny.cu`)**: Pre-allocates a 1 MiB `f16_act_buf` before CUDA graph capture and caches the FP16 conversion of `src1` across consecutive projections sharing the same input (`Q/K/V`, `ssm_in/ssm_z`, unfused `gate/up`), invalidating on any overlapping write. Cut `convert_unary_cont_vec4<float, __half>` from `1.49 ms/check` (`418` calls) to **`0.79 ms/check`** (`287` calls, **−47% time, −131 launches/check**).
+- **Stage 7E-v2 — Single-Pass `float4` Multi-Row Tiled `q8-small.cu`**: Replaced the 2-kernel `q8_small_partial`/`reduce` (`1.41 ms/check`, 192 launches/check across 96 GDN `ssm_alpha`/`ssm_beta` projections) with `q8_small_tiled_kernel<3,4,8>` (`64` CTAs = 1 wave on 80 SMs, 8 lanes per `block_q8_0`, `float4` activation loads reused across 3 weight rows in registers). Cut `q8_small` to **`0.88 ms/check`** (**−37%**, `258/258 MUL_MAT q8_0` PASS).
+- **Stage 7F — `sm70_fa96 v6` Double-Buffered Smem + Pre-Scaled `Q` (`fattn-sm70-q8-96.cuh/.cu`)**: Reclaimed 9 KB of unused `kScoresBytes` for double-buffered `k_s`/`v_s` (`96,768 B < 96 KB`), cutting `4 → 3` `__syncthreads()` per KV tile, and pre-multiplied `Q` by `scale * Log2E` (converting `partial_m` back via `* Ln2`). Improved all three lengths (`16K: 245.8 → 241.7 us`, `64K: 708.6 → 703.5 us`, `128K: 1,361.4 → 1,354.9 us`).
+- **Stage 7D-1 — Adaptive KV Padding (`src/llama-kv-cache.cpp`)**: `llama_kv_cache::get_n_kv()` scales padding from `256` to `1024` (`> 4K`) and `4096` (`> 16K`), cutting `52 ms` mid-decode `cudaFreeHost + cudaMallocHost + cudaGraphInstantiate` graph-resize freezes by 16× at long context (`0` mid-decode host allocs in 64K `nsys`).
+- **Stage 7A — `k8v4` (`-ctk q8_0 -ctv q4_0`) Async `v5d` `Q4_0` + Warp `Q4_0` `set-rows`**: Added `case 7` (`Q8_0` K + `Q4_0` V) with branchless `PRMT+HADD2(0xE408E408)+HMUL2` `commit_q4_row` and bit-exact `k_set_rows_q4_0_warp`. Saves ~3 GiB VRAM (for 300K+ ctx) at `q8_0/q8_0` decode speed (`1,347` vs `1,355 us` @ 128K; `sm70_fa96` is Volta FP16 Tensor Core / 220 W power-bound at ~210 GB/s).
+
 ---
 
-## 4. What We Tried & Reverted (Lessons Learned)
+## 4. What We Tried & Reverted / Left Opt-In OFF (Lessons Learned)
 
-| Experiment | Measured Result | Why It Lost on Volta `sm_70` |
+| Experiment | Measured Result | Why It Lost / Stayed Opt-In on Volta `sm_70` |
 |---|---|---|
+| `LLAMA_SM70_LAZY_BS=1` (Stage 7B) | `+3.4%` long prose (`55.6 → 57.5`), `-10.3%` short 12K tool turns (`179.9 → 161.3`) | Detaching backend sampler mid-turn on `<tool_call>` triggers `sched_need_reserve` (~50 ms CUDA graph re-instantiation). Left opt-in OFF. |
+| `LLAMA_SM70_CTX_LOOKUP=1` (Stage 7C) | `+5.5%` verbatim code copy (`311.9 → 329.2`, bit-exact), tie on novel prose | Lossless 16-token prompt-suffix lookup (`n_want <= 14`, skips stochastic `draft_q`). Left opt-in OFF by default. |
 | `DSpine-b16-Q8_0` drafter | `121.6` vs `125.9 tok/s`, `+900 MiB` VRAM | Extra draft bandwidth cost outweighed tiny acceptance gain. |
 | Direct F32 activation input in `q4k-skinny.cu` | `100.1` vs `125.9 tok/s` (−20.5%) | 80–544 CTAs redundantly read 2× wider F32 activations from L2 and ran 32 `F2F` ops/sub-block vs converting `src1 → F16` once. |
 | Fused `gdn_prologue` (`l2_norm` inside GDN) | `75.0 → 86.3 us`, `130.9 → 129.7 tok/s` | Raised register pressure `89 → 110`, halving CTA occupancy from 2 to 1 CTA/SM. |
