@@ -1201,16 +1201,20 @@ void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * 
 static half * qskinny_get_f16_input(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
                                     int64_t ne, ggml_cuda_pool_alloc<half> & pool_alloc) {
     const size_t f16_bytes = (size_t) ne * sizeof(half);
-    if (ctx.curr_stream_no == 0 && ctx.f16_act_buf != nullptr && f16_bytes <= ctx.f16_act_cap) {
-        half * ptr = (half *) ctx.f16_act_buf;
-        if (ctx.f16_act_src != src1->data || ctx.f16_act_ne != ne) {
-            const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-            GGML_ASSERT(to_fp16 != nullptr);
-            to_fp16(src1->data, ptr, ne, ctx.stream());
-            ctx.f16_act_src = src1->data;
-            ctx.f16_act_src_bytes = (size_t) ne * sizeof(float);
-            ctx.f16_act_ne = ne;
+    const size_t half_cap = ctx.f16_act_cap >> 1;
+    if (ctx.curr_stream_no == 0 && ctx.f16_act_buf != nullptr && f16_bytes <= half_cap) {
+        if (ctx.f16_act_src == src1->data && (ctx.f16_act_ne == ne || ctx.f16_act_ne == -ne)) {
+            return (ctx.f16_act_ne > 0)
+                ? (half *) ctx.f16_act_buf
+                : (half *) ((uint8_t *) ctx.f16_act_buf + half_cap);
         }
+        half * ptr = (half *) ctx.f16_act_buf;
+        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+        GGML_ASSERT(to_fp16 != nullptr);
+        to_fp16(src1->data, ptr, ne, ctx.stream());
+        ctx.f16_act_src = src1->data;
+        ctx.f16_act_src_bytes = (size_t) ne * sizeof(float);
+        ctx.f16_act_ne = ne;
         return ptr;
     }
     pool_alloc.alloc(ne);

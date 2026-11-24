@@ -1450,7 +1450,7 @@ template <ggml_type T, int SplitK, int NAcc, bool M1Only = false, int RowTiles =
 __global__ void __launch_bounds__(32 * SplitK, RowTiles == 1 ? 2 : 1)
 q4k_skinny_gated_kernel(
     const uint8_t * __restrict__ gate_codes, const uint8_t * __restrict__ up_codes,
-    const half * __restrict__ input, float * __restrict__ output,
+    const half * __restrict__ input, float * __restrict__ output, half * __restrict__ f16_out,
     int n, int k, int m) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     using codec = qskinny_codec<T>;
@@ -1596,12 +1596,18 @@ q4k_skinny_gated_kernel(
                 const float gate = gate_red[slot];
                 const float silu = gate / (1.0f + expf(-gate));
                 if constexpr (M1Only) {
-                    output[tile * 32 + element] = silu * value;
+                    const float res = silu * value;
+                    const size_t oi = (size_t) tile * 32 + element;
+                    output[oi] = res;
+                    if (f16_out) { f16_out[oi] = __float2half(res); }
                 } else {
                     const int output_row = element >> 5;
                     const int output_col = element & 31;
                     if (output_row < m) {
-                        output[(size_t) output_row * n + tile * 32 + output_col] = silu * value;
+                        const float res = silu * value;
+                        const size_t oi = (size_t) output_row * n + tile * 32 + output_col;
+                        output[oi] = res;
+                        if (f16_out) { f16_out[oi] = __float2half(res); }
                     }
                 }
             }
@@ -1745,7 +1751,7 @@ template <ggml_type T, int SplitK, int NAcc, int RowTiles>
 __launch_bounds__(32 * SplitK, 512 / (32 * SplitK))
 __global__ void q4k_skinny_gated_nt_kernel(
     const uint8_t * __restrict__ gate_codes, const uint8_t * __restrict__ up_codes,
-    const half * __restrict__ input, float * __restrict__ output, int n, int k, int m) {
+    const half * __restrict__ input, float * __restrict__ output, half * __restrict__ f16_out, int n, int k, int m) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     using codec = qskinny_codec<T>;
     constexpr int kOutputElements = RowTiles * 256;
@@ -1887,7 +1893,10 @@ __global__ void q4k_skinny_gated_nt_kernel(
                 const int output_row = element >> 5;
                 const int output_col = element & 31;
                 if (output_row < m) {
-                    output[(size_t) output_row * n + tile * 32 + output_col] = silu * value;
+                    const float res = silu * value;
+                    const size_t oi = (size_t) output_row * n + tile * 32 + output_col;
+                    output[oi] = res;
+                    if (f16_out) { f16_out[oi] = __float2half(res); }
                 }
             }
         }
@@ -1903,26 +1912,26 @@ __global__ void q4k_skinny_gated_nt_kernel(
 // bit-exact with its own q4k_skinny_kernel launch.
 template <ggml_type T, int SplitK, int NAcc, bool M1Only, int RowTiles>
 static void q4k_skinny_gated_launch(const uint8_t * gate_codes, const uint8_t * up_codes,
-                                    const half * input, float * output, int n, int k, int m,
+                                    const half * input, float * output, half * f16_out, int n, int k, int m,
                                     cudaStream_t stream) {
     q4k_skinny_gated_kernel<T, SplitK, NAcc, M1Only, RowTiles>
-        <<<n / 32, 32 * SplitK, 0, stream>>>(gate_codes, up_codes, input, output, n, k, m);
+        <<<n / 32, 32 * SplitK, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
 }
 
 #define Q4K_SKINNY_GATED_LAUNCH(NAcc, M1Only, RowTiles)                                        \
     do {                                                                                       \
         switch (config.split_k) {                                                              \
             case 16: q4k_skinny_gated_launch<T, 16, NAcc, M1Only, RowTiles>(                    \
-                         gate_codes, up_codes, input, output, n, k, m, stream); break;         \
+                         gate_codes, up_codes, input, output, f16_out, n, k, m, stream); break;\
             default: q4k_skinny_gated_launch<T, 8, NAcc, M1Only, RowTiles>(                     \
-                         gate_codes, up_codes, input, output, n, k, m, stream); break;         \
+                         gate_codes, up_codes, input, output, f16_out, n, k, m, stream); break;\
         }                                                                                      \
     } while (0)
 
 // the launch table is instantiated per codec type
 template <ggml_type T>
 static void q4k_skinny_gated_mul_mat_launch_t(const uint8_t * gate_codes, const uint8_t * up_codes,
-                                              const half * input, float * output, int n, int k, int m,
+                                              const half * input, float * output, half * f16_out, int n, int k, int m,
                                               cudaStream_t stream) {
     const q4k_skinny_config config = q4k_skinny_config_for(k);
     // one pass (v100fast): at 9 to 16 input rows the gate and the up weights share each sub-block's input
@@ -1939,15 +1948,15 @@ static void q4k_skinny_gated_mul_mat_launch_t(const uint8_t * gate_codes, const 
     if (nt_on && m >= 2) {
         if (m <= 8) {
             if (config.split_k == 16 && !(gnt_sk8 && n / 32 >= 160)) {
-                q4k_skinny_gated_nt_kernel<T, 16, 1, 1><<<n / 32, 32 * 16, 0, stream>>>(gate_codes, up_codes, input, output, n, k, m);
+                q4k_skinny_gated_nt_kernel<T, 16, 1, 1><<<n / 32, 32 * 16, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
             } else {
-                q4k_skinny_gated_nt_kernel<T, 8, 1, 1><<<n / 32, 32 * 8, 0, stream>>>(gate_codes, up_codes, input, output, n, k, m);
+                q4k_skinny_gated_nt_kernel<T, 8, 1, 1><<<n / 32, 32 * 8, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
             }
         } else {
             if (config.split_k == 16 && !(gnt_sk8 && n / 32 >= 160)) {
-                q4k_skinny_gated_nt_kernel<T, 16, 1, 2><<<n / 32, 32 * 16, 0, stream>>>(gate_codes, up_codes, input, output, n, k, m);
+                q4k_skinny_gated_nt_kernel<T, 16, 1, 2><<<n / 32, 32 * 16, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
             } else {
-                q4k_skinny_gated_nt_kernel<T, 8, 1, 2><<<n / 32, 32 * 8, 0, stream>>>(gate_codes, up_codes, input, output, n, k, m);
+                q4k_skinny_gated_nt_kernel<T, 8, 1, 2><<<n / 32, 32 * 8, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
             }
         }
         return;
@@ -1965,16 +1974,16 @@ static void q4k_skinny_gated_mul_mat_launch_t(const uint8_t * gate_codes, const 
 
 static void q4k_skinny_gated_mul_mat_launch(ggml_type type, const uint8_t * gate_codes,
                                             const uint8_t * up_codes, const half * input,
-                                            float * output, int n, int k, int m,
+                                            float * output, half * f16_out, int n, int k, int m,
                                             cudaStream_t stream) {
     switch (type) {
-        case GGML_TYPE_Q2_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q2_K>(gate_codes, up_codes, input, output, n, k, m, stream); break;
-        case GGML_TYPE_Q3_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q3_K>(gate_codes, up_codes, input, output, n, k, m, stream); break;
-        case GGML_TYPE_Q4_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q4_K>(gate_codes, up_codes, input, output, n, k, m, stream); break;
-        case GGML_TYPE_Q5_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q5_K>(gate_codes, up_codes, input, output, n, k, m, stream); break;
-        case GGML_TYPE_Q6_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q6_K>(gate_codes, up_codes, input, output, n, k, m, stream); break;
-        case GGML_TYPE_IQ4_XS: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_IQ4_XS>(gate_codes, up_codes, input, output, n, k, m, stream); break;
-        case GGML_TYPE_IQ4_NL: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_IQ4_NL>(gate_codes, up_codes, input, output, n, k, m, stream); break;
+        case GGML_TYPE_Q2_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q2_K>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); break;
+        case GGML_TYPE_Q3_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q3_K>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); break;
+        case GGML_TYPE_Q4_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q4_K>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); break;
+        case GGML_TYPE_Q5_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q5_K>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); break;
+        case GGML_TYPE_Q6_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q6_K>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); break;
+        case GGML_TYPE_IQ4_XS: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_IQ4_XS>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); break;
+        case GGML_TYPE_IQ4_NL: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_IQ4_NL>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); break;
         default: GGML_ABORT("q4k skinny: unknown type");
     }
     CUDA_CHECK(cudaGetLastError());
@@ -1986,7 +1995,7 @@ template <ggml_type TG, ggml_type TU, int SplitK, int RowTiles>
 __launch_bounds__(32 * SplitK, 512 / (32 * SplitK))
 __global__ void q4k_skinny_gated_nt_mixed_kernel(
     const uint8_t * __restrict__ gate_codes, const uint8_t * __restrict__ up_codes,
-    const half * __restrict__ input, float * __restrict__ output, int n, int k, int m) {
+    const half * __restrict__ input, float * __restrict__ output, half * __restrict__ f16_out, int n, int k, int m) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     using codec_g = qskinny_codec<TG>;
     using codec_u = qskinny_codec<TU>;
@@ -2135,7 +2144,10 @@ __global__ void q4k_skinny_gated_nt_mixed_kernel(
                 if (output_row < m) {
                     const float g = gate_red[idx];
                     const float silu = g / (1.0f + expf(-g));
-                    output[(size_t) output_row * n + tile * 32 + output_col] = silu * value;
+                    const float res = silu * value;
+                    const size_t oi = (size_t) output_row * n + tile * 32 + output_col;
+                    output[oi] = res;
+                    if (f16_out) { f16_out[oi] = __float2half(res); }
                 }
             }
         }
@@ -2149,7 +2161,7 @@ __global__ void q4k_skinny_gated_nt_mixed_kernel(
 
 template <ggml_type TG, ggml_type TU>
 static void q4k_skinny_gated_mixed_launch_t(const uint8_t * gate_codes, const uint8_t * up_codes,
-                                            const half * input, float * output, int n, int k, int m,
+                                            const half * input, float * output, half * f16_out, int n, int k, int m,
                                             cudaStream_t stream) {
     const q4k_skinny_config config = q4k_skinny_config_for(k);
     static const bool gnt_sk8 = [] {
@@ -2158,15 +2170,15 @@ static void q4k_skinny_gated_mixed_launch_t(const uint8_t * gate_codes, const ui
     }();
     if (m <= 8) {
         if (config.split_k == 16 && !(gnt_sk8 && n / 32 >= 160)) {
-            q4k_skinny_gated_nt_mixed_kernel<TG, TU, 16, 1><<<n / 32, 32 * 16, 0, stream>>>(gate_codes, up_codes, input, output, n, k, m);
+            q4k_skinny_gated_nt_mixed_kernel<TG, TU, 16, 1><<<n / 32, 32 * 16, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
         } else {
-            q4k_skinny_gated_nt_mixed_kernel<TG, TU, 8, 1><<<n / 32, 32 * 8, 0, stream>>>(gate_codes, up_codes, input, output, n, k, m);
+            q4k_skinny_gated_nt_mixed_kernel<TG, TU, 8, 1><<<n / 32, 32 * 8, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
         }
     } else {
         if (config.split_k == 16 && !(gnt_sk8 && n / 32 >= 160)) {
-            q4k_skinny_gated_nt_mixed_kernel<TG, TU, 16, 2><<<n / 32, 32 * 16, 0, stream>>>(gate_codes, up_codes, input, output, n, k, m);
+            q4k_skinny_gated_nt_mixed_kernel<TG, TU, 16, 2><<<n / 32, 32 * 16, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
         } else {
-            q4k_skinny_gated_nt_mixed_kernel<TG, TU, 8, 2><<<n / 32, 32 * 8, 0, stream>>>(gate_codes, up_codes, input, output, n, k, m);
+            q4k_skinny_gated_nt_mixed_kernel<TG, TU, 8, 2><<<n / 32, 32 * 8, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
         }
     }
     CUDA_CHECK(cudaGetLastError());
@@ -2197,23 +2209,23 @@ static bool q4k_skinny_gated_mixed_supported(ggml_type tg, ggml_type tu) {
 
 static bool q4k_skinny_gated_mixed_launch(ggml_type tg, ggml_type tu, const uint8_t * gate_codes,
                                           const uint8_t * up_codes, const half * input,
-                                          float * output, int n, int k, int m, cudaStream_t stream) {
+                                          float * output, half * f16_out, int n, int k, int m, cudaStream_t stream) {
     const int key = ((int) tg << 8) | (int) tu;
     switch (key) {
-        case ((int) GGML_TYPE_Q4_K   << 8) | (int) GGML_TYPE_Q5_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q4_K,   GGML_TYPE_Q5_K  >(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_Q5_K   << 8) | (int) GGML_TYPE_Q4_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q5_K,   GGML_TYPE_Q4_K  >(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_IQ4_XS << 8) | (int) GGML_TYPE_Q5_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K  >(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_Q5_K   << 8) | (int) GGML_TYPE_IQ4_XS: q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q5_K,   GGML_TYPE_IQ4_XS>(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_IQ4_XS << 8) | (int) GGML_TYPE_Q4_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K  >(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_Q4_K   << 8) | (int) GGML_TYPE_IQ4_XS: q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q4_K,   GGML_TYPE_IQ4_XS>(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_Q6_K   << 8) | (int) GGML_TYPE_Q5_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q6_K,   GGML_TYPE_Q5_K  >(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_Q5_K   << 8) | (int) GGML_TYPE_Q6_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q5_K,   GGML_TYPE_Q6_K  >(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_IQ4_XS << 8) | (int) GGML_TYPE_Q3_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_IQ4_XS, GGML_TYPE_Q3_K  >(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_Q3_K   << 8) | (int) GGML_TYPE_IQ4_XS: q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q3_K,   GGML_TYPE_IQ4_XS>(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_IQ4_NL << 8) | (int) GGML_TYPE_IQ4_XS: q4k_skinny_gated_mixed_launch_t<GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS>(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_IQ4_XS << 8) | (int) GGML_TYPE_IQ4_NL: q4k_skinny_gated_mixed_launch_t<GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL>(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_IQ4_NL << 8) | (int) GGML_TYPE_Q5_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_K  >(gate_codes, up_codes, input, output, n, k, m, stream); return true;
-        case ((int) GGML_TYPE_Q5_K   << 8) | (int) GGML_TYPE_IQ4_NL: q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q5_K,   GGML_TYPE_IQ4_NL>(gate_codes, up_codes, input, output, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_Q4_K   << 8) | (int) GGML_TYPE_Q5_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q4_K,   GGML_TYPE_Q5_K  >(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_Q5_K   << 8) | (int) GGML_TYPE_Q4_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q5_K,   GGML_TYPE_Q4_K  >(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_IQ4_XS << 8) | (int) GGML_TYPE_Q5_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K  >(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_Q5_K   << 8) | (int) GGML_TYPE_IQ4_XS: q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q5_K,   GGML_TYPE_IQ4_XS>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_IQ4_XS << 8) | (int) GGML_TYPE_Q4_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K  >(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_Q4_K   << 8) | (int) GGML_TYPE_IQ4_XS: q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q4_K,   GGML_TYPE_IQ4_XS>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_Q6_K   << 8) | (int) GGML_TYPE_Q5_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q6_K,   GGML_TYPE_Q5_K  >(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_Q5_K   << 8) | (int) GGML_TYPE_Q6_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q5_K,   GGML_TYPE_Q6_K  >(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_IQ4_XS << 8) | (int) GGML_TYPE_Q3_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_IQ4_XS, GGML_TYPE_Q3_K  >(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_Q3_K   << 8) | (int) GGML_TYPE_IQ4_XS: q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q3_K,   GGML_TYPE_IQ4_XS>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_IQ4_NL << 8) | (int) GGML_TYPE_IQ4_XS: q4k_skinny_gated_mixed_launch_t<GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_IQ4_XS << 8) | (int) GGML_TYPE_IQ4_NL: q4k_skinny_gated_mixed_launch_t<GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_IQ4_NL << 8) | (int) GGML_TYPE_Q5_K:   q4k_skinny_gated_mixed_launch_t<GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_K  >(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
+        case ((int) GGML_TYPE_Q5_K   << 8) | (int) GGML_TYPE_IQ4_NL: q4k_skinny_gated_mixed_launch_t<GGML_TYPE_Q5_K,   GGML_TYPE_IQ4_NL>(gate_codes, up_codes, input, output, f16_out, n, k, m, stream); return true;
         default: return false;
     }
 }
@@ -2416,16 +2428,20 @@ static bool q4k_skinny_mul_mat_dispatch(ggml_type type, const uint8_t * codes, c
 static half * qskinny_get_f16_input(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
                                     int64_t ne, ggml_cuda_pool_alloc<half> & pool_alloc) {
     const size_t f16_bytes = (size_t) ne * sizeof(half);
-    if (ctx.curr_stream_no == 0 && ctx.f16_act_buf != nullptr && f16_bytes <= ctx.f16_act_cap) {
-        half * ptr = (half *) ctx.f16_act_buf;
-        if (ctx.f16_act_src != src1->data || ctx.f16_act_ne != ne) {
-            const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-            GGML_ASSERT(to_fp16 != nullptr);
-            to_fp16(src1->data, ptr, ne, ctx.stream());
-            ctx.f16_act_src = src1->data;
-            ctx.f16_act_src_bytes = (size_t) ne * sizeof(float);
-            ctx.f16_act_ne = ne;
+    const size_t half_cap = ctx.f16_act_cap >> 1;
+    if (ctx.curr_stream_no == 0 && ctx.f16_act_buf != nullptr && f16_bytes <= half_cap) {
+        if (ctx.f16_act_src == src1->data && (ctx.f16_act_ne == ne || ctx.f16_act_ne == -ne)) {
+            return (ctx.f16_act_ne > 0)
+                ? (half *) ctx.f16_act_buf
+                : (half *) ((uint8_t *) ctx.f16_act_buf + half_cap);
         }
+        half * ptr = (half *) ctx.f16_act_buf;
+        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+        GGML_ASSERT(to_fp16 != nullptr);
+        to_fp16(src1->data, ptr, ne, ctx.stream());
+        ctx.f16_act_src = src1->data;
+        ctx.f16_act_src_bytes = (size_t) ne * sizeof(float);
+        ctx.f16_act_ne = ne;
         return ptr;
     }
     pool_alloc.alloc(ne);
@@ -2488,15 +2504,34 @@ bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const g
     half * input_ptr = qskinny_get_f16_input(ctx, src1, m * k, input_pool);
 
     if (m <= 16) {
+        static const bool gated_f16_out = [] {
+            const char * e = getenv("LLAMA_SM70_GATED_F16_OUT");
+            return e == nullptr || e[0] != '0';
+        }();
+        const size_t half_cap = ctx.f16_act_cap >> 1;
+        const size_t out_f16_bytes = (size_t) (n * m) * sizeof(half);
+        half * base0 = (half *) ctx.f16_act_buf;
+        half * base1 = (half *) ((uint8_t *) ctx.f16_act_buf + half_cap);
+        const bool can_f16 = gated_f16_out && ctx.curr_stream_no == 0 && ctx.f16_act_buf != nullptr && out_f16_bytes <= half_cap;
+        const bool use_slot1 = (input_ptr == base0);
+        half * f16_out = can_f16 ? (use_slot1 ? base1 : base0) : nullptr;
+
+        bool ok = true;
         if (mixed) {
-            return q4k_skinny_gated_mixed_launch(gate_w->type, up_w->type, (const uint8_t *) gate_w->data,
-                                                 (const uint8_t *) up_w->data, input_ptr, (float *) dst->data,
-                                                 (int) n, (int) k, (int) m, ctx.stream());
+            ok = q4k_skinny_gated_mixed_launch(gate_w->type, up_w->type, (const uint8_t *) gate_w->data,
+                                               (const uint8_t *) up_w->data, input_ptr, (float *) dst->data,
+                                               f16_out, (int) n, (int) k, (int) m, ctx.stream());
+        } else {
+            q4k_skinny_gated_mul_mat_launch(gate_w->type, (const uint8_t *) gate_w->data,
+                                            (const uint8_t *) up_w->data, input_ptr, (float *) dst->data,
+                                            f16_out, (int) n, (int) k, (int) m, ctx.stream());
         }
-        q4k_skinny_gated_mul_mat_launch(gate_w->type, (const uint8_t *) gate_w->data,
-                                        (const uint8_t *) up_w->data, input_ptr, (float *) dst->data,
-                                        (int) n, (int) k, (int) m, ctx.stream());
-        return true;
+        if (ok && f16_out != nullptr) {
+            ctx.f16_act_src       = dst->data;
+            ctx.f16_act_src_bytes = (size_t) (n * m) * sizeof(float);
+            ctx.f16_act_ne        = use_slot1 ? -(n * m) : (n * m);
+        }
+        return ok;
     }
 
     // M = 17..64 runs both projections with the M=32 kernel, then the SwiGLU epilogue, with

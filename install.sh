@@ -117,7 +117,7 @@ fi
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
   CANDIDATE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [ -f "$CANDIDATE/patches/v100fast-stage7.patch" ] && [ -d "$CANDIDATE/overlay/ggml" ]; then
+  if [ -f "$CANDIDATE/patches/v100fast-stage8.patch" ] && [ -d "$CANDIDATE/overlay/ggml" ]; then
     SCRIPT_DIR="$CANDIDATE"
   fi
 fi
@@ -140,7 +140,7 @@ mkdir -p "$REPO_DIR/models"
 
 # 1. Build v100fast engine
 if [ "$SKIP_BUILD" -eq 0 ]; then
-  log "Cloning pinned llama.cpp (DSpine base) + applying Stage 7 V100 patches & building for sm_70"
+  log "Cloning pinned llama.cpp (DSpine base) + applying Stage 8 V100 patches & building for sm_70"
   bash "$REPO_DIR/scripts/build.sh" "$REPO_DIR/engine"
 else
   log "Skipping engine build (--skip-build)"

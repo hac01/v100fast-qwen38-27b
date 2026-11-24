@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch Qwen3.8-27B + DSpine on Tesla V100-PCIE-32GB with all verified Stage 7 optimizations.
+# Launch Qwen3.8-27B + DSpine on Tesla V100-PCIE-32GB with all verified Stage 8 optimizations.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,8 +61,8 @@ if [ -n "$DRAFT_FILE" ] && [ "$DRAFT_FILE" != "none" ]; then
       --spec-type draft-dflash
       --spec-draft-n-max "$NMAX"
       --spec-draft-ngl 999
-      --spec-draft-type-k q8_0
-      --spec-draft-type-v q8_0
+      --spec-draft-type-k f16
+      --spec-draft-type-v f16
       --spec-draft-sampling probabilistic
     )
   else
@@ -77,7 +77,7 @@ if [ "${PL:-0}" -gt 0 ] && command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 
-# Stage 7 Volta sm_70 kernel flags (all verified 100% bit-exact)
+# Stage 8 Volta sm_70 kernel flags (all verified 100% bit-exact)
 export LLAMA_SM70_FA96=1
 export LLAMA_SM70_GDN_CHUNK=1
 export LLAMA_SM70_GDN_REPLAY=1
