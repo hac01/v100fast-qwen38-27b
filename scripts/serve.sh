@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch Qwen3.8-27B + DSpine on Tesla V100-PCIE-32GB with all verified Stage 8 optimizations.
+# Launch Qwen3.8-27B + DSpine on Tesla V100-PCIE-32GB with all verified Stage 9 optimizations.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,10 +77,18 @@ if [ "${PL:-0}" -gt 0 ] && command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 
-# Stage 8 Volta sm_70 kernel flags (all verified 100% bit-exact)
-export LLAMA_SM70_FA96=1
-export LLAMA_SM70_GDN_CHUNK=1
-export LLAMA_SM70_GDN_REPLAY=1
+# Stage 9 Volta sm_70 kernel & dynamic-block flags (all strictly lossless; override any to 0 to disable)
+export LLAMA_SM70_FA96="${LLAMA_SM70_FA96:-1}"
+export LLAMA_SM70_FA96_LDG="${LLAMA_SM70_FA96_LDG:-1}"
+export LLAMA_SM70_GDN_CHUNK="${LLAMA_SM70_GDN_CHUNK:-1}"
+export LLAMA_SM70_GDN_REPLAY="${LLAMA_SM70_GDN_REPLAY:-1}"
+export LLAMA_SM70_BF16_CACHE="${LLAMA_SM70_BF16_CACHE:-1}"
+export LLAMA_SM70_ASYNC_SET="${LLAMA_SM70_ASYNC_SET:-1}"
+export LLAMA_SM70_SKINNY_3CTA="${LLAMA_SM70_SKINNY_3CTA:-1}"
+export LLAMA_SM70_SKINNY_GNT_3CTA="${LLAMA_SM70_SKINNY_GNT_3CTA:-1}"
+export LLAMA_SM70_SKINNY_WAVEFIX="${LLAMA_SM70_SKINNY_WAVEFIX:-1}"
+export LLAMA_SM70_SKINNY_N5120_2CTA="${LLAMA_SM70_SKINNY_N5120_2CTA:-1}"
+export LLAMA_SM70_DYN_BLOCK="${LLAMA_SM70_DYN_BLOCK:-1}"
 
 EXTRA_ARGS=()
 if [ -n "$API_KEY_FILE" ]; then

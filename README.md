@@ -1,6 +1,6 @@
 # v100fast-qwen38-27b
 
-**Make Qwen3.8-27B + DSpine fly on a single NVIDIA Tesla V100 (`sm_70`, 32 GB) — `120 tok/s` chat, `180 tok/s` code, `198–204 tok/s` at 12K agent context, `98 tok/s` (`104.7` peak) at 50K context, and `86 tok/s` (`103.1` peak) at 100K context, with zero quality loss (`UD-Q4_K_XL` + `q8_0` target KV cache).**
+**Make Qwen3.8-27B + DSpine fly on a single NVIDIA Tesla V100 (`sm_70`, 32 GB) — `130 tok/s` chat, `175–182 tok/s` code, `206 tok/s` at 12K agent context, `105 tok/s` (`115.7` peak) at 50K context, and `92 tok/s` (`105.3` peak) at 100K context, with zero quality loss (`UD-Q4_K_XL` + `q8_0` target KV cache).**
 
 All numbers below were measured on a single **Tesla V100-PCIE-32GB** capped at **220 W** (`ECC ON`, `0` uncorrected ECC) with `Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL.gguf` + `Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf` (`-c 229376 -ub 2048 -ctk q8_0 -ctv q8_0 --spec-draft-type-k f16 --spec-draft-type-v f16 --backend-sampling`).
 
@@ -8,35 +8,35 @@ All numbers below were measured on a single **Tesla V100-PCIE-32GB** capped at *
 
 ## Measured Benchmarks (Single V100-PCIE-32GB @ 220 W)
 
-| Workload | Baseline (`dspine` upstream) | Stage 6 (`s6_v2`) | Stage 7 (`s7v2`, cooled) | **Stage 8 (`s8i`, hot 56–59 °C)** | Speedup vs Baseline |
-|---|---:|---:|---:|---:|---:|
-| **Chat (short)** | 57.9 tok/s | 113.9 tok/s | 115.5 tok/s | **119.9 tok/s** | **2.07× (+107.1%)** |
-| **Code (short)** | 87.3 tok/s | 168.8 tok/s | 171.4 tok/s | **179.6 tok/s** | **2.06× (+105.7%)** |
-| **Agent (12K ctx, tools)** | 83.9 tok/s | 179.9 tok/s | 184.3 tok/s | **198.0 tok/s** *(203.6 on `s8g`)* | **2.36–2.43× (+136–143%)** |
-| **All 12K Suite Avg** | — | 147.9 tok/s | 150.3 tok/s | **157.3 tok/s** | — |
-| **Agent (50K ctx, tools)** | 55.1 tok/s | 86.5 tok/s *(pk 91.6)* | 89.0 tok/s *(pk 95.2)* | **97.9 tok/s** *(pk **104.7**)* | **1.78× (+77.7%)** |
-| **Agent (100K ctx, tools)** | 42.2 tok/s | 78.2 tok/s *(pk 92.4)* | 79.9 tok/s *(pk 94.8)* | **85.9 tok/s** *(pk **103.1**)* | **2.04× (+103.6%)** |
-| **64K `nsys` Decode (300 tok)** | — | — | 59.8 tok/s | **63.9 tok/s** | **+6.9% vs Stage 7** |
-| **64K Verify Step (GPU / wall)** | ~125 / ~130 ms | 60.98 / 66.03 ms *(92% busy)* | 60.61 / 64.73 ms *(94% busy)* | **57.54 / 61.63 ms** *(93% busy)* | **2.11× (−52.6% wall)** |
-| **Prompt Read (12K / 50K / 100K)** | 898 / 709 / — tok/s | 1,080 / 874 / 628 tok/s | 1,083 / 875 / 628 tok/s | **1,071 / 872 / 627 tok/s** | **+19% / +23%** |
-| **155K Live Coding Session** | — | 55.2 – 66.6 tok/s | — | — | — |
-| **196K Stress Test** | — | 550.3 pp / 37.5 tg (`31,058 MiB`) | — | — | — |
-| **Verbatim Code Copy** *(opt-in `LLAMA_SM70_CTX_LOOKUP=1`)* | — | 311.9 tok/s *(DSpine only)* | 329.2 tok/s *(bit-exact)* | — | **+5.5% over DSpine** |
-| **Deterministic `temp=0` Parity** | 61.0 tok/s | 115.55 tok/s | head=15/15, 4/4, 4/4 | **head=15/15 (12K), 4/4 (50K), 4/4 (100K)** | **100% parity** |
+| Workload | Baseline (`dspine` upstream) | Stage 6 (`s6_v2`) | Stage 7 (`s7v2`, cooled) | Stage 8 (`s8i`, hot 56–59 °C) | **Stage 9 (`s9_final`, hot 56–60 °C)** | Speedup vs Baseline |
+|---|---:|---:|---:|---:|---:|---:|
+| **Chat (short)** | 57.9 tok/s | 113.9 tok/s | 115.5 tok/s | 119.9 tok/s | **129.9 tok/s** *(+8.3% vs s8)* | **2.24× (+124.4%)** |
+| **Code (short)** | 87.3 tok/s | 168.8 tok/s | 171.4 tok/s | 179.6 tok/s | **174.5 tok/s** *(182.3 on C++ LRU)* | **2.00× (+99.9%)** |
+| **Agent (12K ctx, tools)** | 83.9 tok/s | 179.9 tok/s | 184.3 tok/s | 198.0 tok/s *(203.6 `s8g`)* | **206.1 tok/s** *(+4.1% vs s8)* | **2.46× (+145.6%)** |
+| **All 12K Suite Avg** | — | 147.9 tok/s | 150.3 tok/s | 157.3 tok/s | **160.8 tok/s** *(+2.2% vs s8)* | — |
+| **Agent (50K ctx, tools)** | 55.1 tok/s | 86.5 *(pk 91.6)* | 89.0 *(pk 95.2)* | 97.9 *(pk 104.7)* | **104.9 tok/s** *(pk **115.7**, +7.2%)* | **1.90× (+90.4%)** |
+| **Agent (100K ctx, tools)** | 42.2 tok/s | 78.2 *(pk 92.4)* | 79.9 *(pk 94.8)* | 85.9 *(pk 103.1)* | **91.9 tok/s** *(pk **105.3**, +7.0%)* | **2.18× (+117.8%)** |
+| **Deep-Think (`4K` / `64K` / `128K`)** | — | — | — | 62.6 / 55.4 / 43.4 tok/s | **82.6 / 63.5–70.9 / 52.7 tok/s** | **+32% / +15–28% / +21.5% vs s8** |
+| **64K `nsys` Decode** | — | — | 59.8 tok/s | 63.9 tok/s | **75.9 tok/s** *(+18.8% vs s8)* | — |
+| **64K Verify Step (GPU / wall)** | ~125 / ~130 ms | 60.98 / 66.03 ms *(92%)* | 60.61 / 64.73 ms *(94%)* | 57.54 / 61.63 ms *(93%)* | **47.96 / 49.21 ms** *(**97.5%** busy; 47.1 ms w/ Wave 5)* | **2.76× (−63.8% wall)** |
+| **Prompt Read (12K / 50K / 100K)** | 898 / 709 / — tok/s | 1,080 / 874 / 628 tok/s | 1,083 / 875 / 628 tok/s | 1,071 / 872 / 627 tok/s | **1,070 / 872 / 627 tok/s** | **+19% / +23%** |
+| **155K Live Coding Session** | — | 55.2 – 66.6 tok/s | — | — | — | — |
+| **196K Stress Test** | — | 550.3 pp / 37.5 tg (`31,058 MiB`) | — | — | — | — |
+| **Verbatim Code Copy** *(opt-in `LLAMA_SM70_CTX_LOOKUP=1`)* | — | 311.9 tok/s *(DSpine only)* | 329.2 tok/s *(bit-exact)* | — | — | **+5.5% over DSpine** |
+| **Deterministic `temp=0` Parity** | 61.0 tok/s | 115.55 tok/s | head=15/15, 4/4, 4/4 | head=15/15, 4/4, 4/4 | **100% SHA parity (`easy_code`, `4K`, `64K`, `128K`)** | **100% parity** |
 
-*(Note: Stage 8 `s8i` ran back-to-back without cooldown sleeps at `56–59 °C`, whereas Stage 7 `s7v2` cooled to `<= 45 °C` before each run. On `speed_bench`, `10/10` chat+code prompts match Stage 7 bit-for-bit SHA; the 5 agent turns only differ in random tool-call IDs with identical `head` and acceptance `0.43` / `0.30`.)*
+*(Note: Stage 9 `s9_final` ran back-to-back without cooldown sleeps at `56–60 °C`, `220 W`, `0` uncorrected ECC errors. Every Stage 9 optimization is 100% strictly lossless with respect to `UD-Q4_K_XL` target weights and `q8_0` KV cache and can be toggled off independently via env vars.)*
 
-### 64K `nsys` Kernel Verification (`s7e2` → `s8i`, 75 checks, 220 W)
+### 64K `nsys` Kernel Verification (`s7e2` → `s8i` → `s9`, 220 W)
 
-| Kernel / Family | Stage 7 (`s7e2`) | **Stage 8 (`s8i`)** | Delta |
-|---|---:|---:|---:|
-| **Total Wall / GPU per check** | 64.73 / 60.61 ms | **61.63 / 57.54 ms** | **−3.10 / −3.07 ms (−4.8% / −5.1%)** |
-| **GDN conv + concat + set_rows** (8E-3) | 0.927 ms/chk (`10,944×`) | **0.415 ms/chk (`3,800×`)** | **−55% (−7,144 launches)** |
-| **`q8_small` (`ssm_beta + alpha`)** (8E-2) | 0.878 ms/chk (`6,240×`) | **0.617 ms/chk (`3,648×`)** | **−30% (−3,648 launches)** |
-| **`convert<f32, f16>`** (8D + 8E-1) | 0.792 ms/chk (`18,693×`) | **0.297 ms/chk (`7,676×`)** | **−62% (−11,017 launches)** |
-| **`ADD + RMS_NORM`** (8D) | 1.521 ms/chk (`23,182×`) | **1.062 ms/chk (`15,504×`)** | **−30% (137.8 fused/chk)** |
-| **Un-graphed `cudaLaunchKernel`** (8A) | 1.92 ms/chk (`245×/chk`) | **0.96 ms/chk (`140×/chk`)** | **−50%** |
-| **DSpine FP32 SGEMMs + Q8 draft KV dequant** (8B + `f16` draft KV) | ~1.08 ms/chk | **0.000 ms/chk** | **100% eliminated** |
+| Kernel / Family | Stage 7 (`s7e2`) | Stage 8 (`s8i`) | **Stage 9 (`s9`, `m=8` fast path)** | Delta (`s8 → s9`) |
+|---|---:|---:|---:|---:|
+| **Total Wall / GPU per check** | 64.73 / 60.61 ms | 61.63 / 57.54 ms | **49.21 / 47.96 ms** *(47.13 ms w/ Wave 5)* | **−14.50 ms wall (−23.5%)** |
+| **GPU Idle Gap / check** (`ASYNC_SET=1`) | 4.12 ms (`94.0%` busy) | 4.09 ms (`93.4%` busy) | **1.25 ms (`97.5%` busy)** | **−69% idle** |
+| **`sm70_fa96_decode_kernel`** (`FA96_LDG=1`) | 11.26 ms/chk | 11.18 ms/chk (`698 us/l`) | **7.96 ms/chk (`498 us/l`)** | **−28.8%** |
+| **`q4k_skinny` (`nt` + `gated_nt` + `mixed`)** (`3CTA + WAVEFIX + N5120_2CTA`) | ~35.0 ms/chk | ~34.6 ms/chk | **30.99 ms/chk** *(~29.8 ms w/ Wave 5)* | **−13.9%** |
+| **DSpine `BF16` GEMMs (`BF16_CACHE=1` TC bypass)** | ~1.08 ms/chk | ~0.30 ms/chk *(convert)* | **~0.18 ms/chk** *(cached FP16 TC, `m>=4`)* | **−40% / zero `mul_mat_vec_f`** |
+| **GDN (`replay` + `save` + `ssm_conv` + `q8_small_dual`)** | 3.55 ms/chk | 2.77 ms/chk | **2.28 ms/chk** | **−17.7%** |
 
 ---
 
@@ -50,7 +50,7 @@ curl -fsSL https://raw.githubusercontent.com/hac01/v100fast-qwen38-27b/main/inst
 
 What this does automatically:
 1. Clones pinned [`Ajay9o9/llama.cpp`](https://github.com/Ajay9o9/llama.cpp) (`4703b7d`, DSpine base).
-2. Applies `patches/v100fast-stage8.patch` and copies the custom Volta `sm_70` CUDA kernels from `overlay/`.
+2. Applies `patches/v100fast-stage9.patch` and copies the custom Volta `sm_70` CUDA kernels from `overlay/`.
 3. Compiles `llama-server` and `test-backend-ops` specifically for `sm_70` (`CMAKE_CUDA_ARCHITECTURES=70`).
 4. Downloads `Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL.gguf` (17.4 GB) and `Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf` (1.2 GB) with resumable `curl`.
 5. Writes your ready-to-run config (`.v100fast.env`) sized automatically for your GPU VRAM and system RAM.
@@ -126,6 +126,13 @@ Every optimization is bit-exact or passes full `test-backend-ops` tolerances and
    - Setting `--spec-draft-type-k f16 --spec-draft-type-v f16` on the 5-layer drafter eliminates `dequantize_block_q8_0_f16` (`0.378 → 0.000 ms/chk`) for only `+78 MiB` VRAM.
 9. **Hoisted `s_slot_rev` + Warp `Q8_0`/`Q4_0` KV `set-rows` + Draft Ubatch Cap (`<= 512`)**
    - Removes 141 redundant `arange+scale+cast` launches/step, accelerates KV cache writes (`32` lanes/block), and caps draft scratchpad allocation (`-ub 2048` on target while saving ~1.5 GB VRAM).
+10. **Stage 9 — Dynamic `7 ↔ 15` DSpine Block Hysteresis + 3-CTA/SM & Wave-Matched Skinny GEMMs + Async H2D + Cached `BF16` TC + `__ldg` `FA96`**
+    - **`LLAMA_SM70_DYN_BLOCK=1`** (`common/speculative.cpp`): Dynamically sizes DSpine's block before its forward pass (`n_draft = 7` / `m = 8` on reasoning & long-context steps, promoting to `15` / `m = 16` when all `7/7` draft tokens accept and demoting when `< 6` accept). Cuts both DSpine and target work in half on hard turns while preserving `206 tok/s` agent/tool-call bursts. Both `m = 8` and `m = 16` remain simultaneously live in Stage 8A's multi-slot CUDA graph cache with zero re-captures.
+    - **`LLAMA_SM70_SKINNY_3CTA=1` + `LLAMA_SM70_SKINNY_GNT_3CTA=1`** (`q4k-skinny.cu`): Tightens `__launch_bounds__(256, 3)` on `m <= 8` `Q4_K`/`Q5_K`/`Q6_K`/`IQ4_XS` projections (`lm_head` + all 64 `ffn_gate/up` gated & mixed-quant layers), dropping `Q5_K`/`Q6_K` from `86 → 76–79` regs with **`STACK:0`** to cross Volta's `80`-reg cliff (**3 CTAs/SM = `24` warps/SM, `+50%` occupancy**).
+    - **`LLAMA_SM70_SKINNY_WAVEFIX=1` + `LLAMA_SM70_SKINNY_N5120_2CTA=1`** (`q4k-skinny.cu`): Eliminates the `n = 6144` (`ssm_in`) 96-CTA tail wave (`NTiles=1, SplitK=8, 3CTA` → `REG:56–60, STACK:0`, 192 CTAs in **1 single wave**), doubles active SMs on `n = 1024` (`K/V`, `32` vs `16` CTAs), and doubles occupancy on `n = 5120` (`ffn_down`/`attn_out`/`ssm_out`, `NTiles=1, SplitK=16, MinBlocks=2` → `REG:56–60, STACK:0`, **`32` warps/SM**).
+    - **`LLAMA_SM70_BF16_CACHE=1`** (`ggml-cuda.cu`): Permanently caches immutable `BF16 → F16` weights once at load and bypasses scalar `mul_mat_vec_f` for `BF16` weights at `m >= 4` so DSpine's `25` `BF16` GEMMs always hit Volta FP16 Tensor Cores (`228/228` `MUL_MAT bf16` PASS).
+    - **`LLAMA_SM70_ASYNC_SET=1`** (`ggml-cuda.cu`): 4 MiB pinned-ring async H2D `set_tensor` ordered on the active compute stream (with clean stream-destroy flush), cutting GPU idle gaps from **`4.09 → 1.25 ms/check`** (`97.5%` GPU busy).
+    - **`LLAMA_SM70_FA96_LDG=1`** (`fattn-sm70-q8-96.cu`): L1-coalesced `__ldg` loads for 34-byte `block_q8_0` KV tiles (`REG:165, STACK:0`, **`−0.60 ms/chk`** at 64K).
 
 ---
 
@@ -134,8 +141,16 @@ Every optimization is bit-exact or passes full `test-backend-ops` tolerances and
 | Variable | Default | Purpose |
 |---|---|---|
 | `LLAMA_SM70_FA96` | `0` *(set `1` in `serve.sh`)* | Volta `sm70_fa96` v6 direct `q8_0` / `k8v4` FlashAttention decode |
+| `LLAMA_SM70_FA96_LDG` | `0` *(set `1` in `serve.sh`)* | L1-coalesced `__ldg` `Q8_0` KV loads in `sm70_fa96` (Stage 9) |
 | `LLAMA_SM70_GDN_CHUNK` | `0` *(set `1` in `serve.sh`)* | Volta HMMA chunked GDN prefill |
 | `LLAMA_SM70_GDN_REPLAY` | `0` *(set `1` in `serve.sh`)* | GDN direct-state read + exact FP32 rollback replay |
+| `LLAMA_SM70_BF16_CACHE` | `0` *(set `1` in `serve.sh`)* | Immutable `BF16→F16` weight cache + TC bypass of `mul_mat_vec_f` for `m>=4` (Stage 9) |
+| `LLAMA_SM70_ASYNC_SET` | `0` *(set `1` in `serve.sh`)* | 4 MiB pinned-ring async H2D `set_tensor` on active compute stream (Stage 9) |
+| `LLAMA_SM70_SKINNY_3CTA` | `0` *(set `1` in `serve.sh`)* | 3-CTA/SM (`24` warps/SM, `STACK:0`) `q4k_skinny_nt` for `m <= 8` (Stage 9) |
+| `LLAMA_SM70_SKINNY_GNT_3CTA` | `0` *(set `1` in `serve.sh`)* | 3-CTA/SM (`24` warps/SM, `STACK:0`) across all 64 `ffn_gate/up` layers for `m <= 8` (Stage 9) |
+| `LLAMA_SM70_SKINNY_WAVEFIX` | `0` *(set `1` in `serve.sh`)* | Single-wave 4-CTA/SM `n=6144` (`ssm_in`) + 2× SMs on `n=1024` (`K/V`) (Stage 9) |
+| `LLAMA_SM70_SKINNY_N5120_2CTA` | `0` *(set `1` in `serve.sh`)* | 2-CTA/SM (`32` warps/SM, `STACK:0`) on `n=5120` (`ffn_down`/`attn_out`/`ssm_out`) (Stage 9) |
+| `LLAMA_SM70_DYN_BLOCK` | `0` *(set `1` in `serve.sh`)* | Lossless dynamic `7 ↔ 15` DSpine block-size hysteresis (`DYN_UP=7, DYN_DOWN=6, DYN_STREAK=1`) (Stage 9) |
 | `LLAMA_SM70_MULTI_GRAPH` | `1` (ON) | 8-slot shape-keyed CUDA graph cache (Stage 8A) |
 | `LLAMA_SM70_BF16_AS_F16` | `1` (ON) | Route Volta `BF16` GEMM through FP16 Tensor Cores w/ FP32 acc (Stage 8B) |
 | `LLAMA_SM70_LAZY_BS` | `1` (ON) | GPU grammar-rejection `--backend-sampling` w/ on-demand 1-row fetch (Stage 8C-v2) |
@@ -145,7 +160,7 @@ Every optimization is bit-exact or passes full `test-backend-ops` tolerances and
 | `LLAMA_SM70_DIRECT_SSM_CONV` | `1` (ON) | Fused direct `ssm_conv_direct_d4_f32` + `silu` + conv state store (Stage 8E-3) |
 | `LLAMA_SM70_CTX_LOOKUP` | `0` (OFF) | Optional lossless 16-token prompt-suffix lookup (`+5.5%` on verbatim code copy) |
 
-Set any default-ON Stage 8 variable to `0` to isolate or disable that optimization without rebuilding.
+Set any Stage 8 or Stage 9 variable to `0` to isolate or disable that optimization without rebuilding (with all Stage 9 flags `0`, execution is byte-identical to Stage 8 `s8i`).
 
 ---
 
@@ -176,12 +191,12 @@ Verified passing on Tesla V100-PCIE-32GB (CUDA 12.8):
 v100fast-qwen38-27b/
 ├── install.sh                    # One-line curl installer (build + download + config)
 ├── patches/
-│   └── v100fast-stage8.patch     # Clean git diff against pinned Ajay9o9/llama.cpp@4703b7d
+│   └── v100fast-stage9.patch     # Clean git diff against pinned Ajay9o9/llama.cpp@4703b7d
 ├── overlay/
 │   └── ggml/src/ggml-cuda/       # Custom Volta sm_70 kernels + vendored CuTe/FA2 headers
 ├── scripts/
 │   ├── build.sh                  # Standalone clone + patch + sm_70 CMake build
-│   ├── serve.sh                  # Production server launcher with Stage 8 flags
+│   ├── serve.sh                  # Production server launcher with Stage 9 flags
 │   ├── verify.sh                 # Full CUDA test-backend-ops gate
 │   └── bench.py                  # Reproducible short & long-context benchmark
 ├── docs/

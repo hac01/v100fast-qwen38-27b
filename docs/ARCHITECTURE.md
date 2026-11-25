@@ -1,6 +1,6 @@
 # Architecture & Volta (`sm_70`) Optimization Deep Dive
 
-This document explains why **Qwen3.8-27B + DSpine** runs **~2.0–2.4× faster** on a single Tesla V100-PCIE-32GB (`sm_70`, 220 W, `q8_0` target KV + `f16` draft KV) with `v100fast` Stage 8, including the `cuobjdump -sass` and `nsys` findings that drove every optimization — and the experiments we tested and reverted or left opt-in OFF.
+This document explains why **Qwen3.8-27B + DSpine** runs **~2.0–2.5× faster** on a single Tesla V100-PCIE-32GB (`sm_70`, 220 W, `q8_0` target KV + `f16` draft KV) with `v100fast` Stage 9, including the `cuobjdump -sass` and `nsys` findings that drove every optimization — and the experiments we tested and reverted or left opt-in OFF.
 
 ---
 
@@ -25,7 +25,8 @@ Measured via `nsys --cuda-graph-trace=node` at 64K context (`n_draft = 15`, 16-t
 | Stage 6 (`s6e_replay`) | 62.68 ms | 69.73 ms | 90.0% | **GDN direct-state + exact FP32 rollback replay** (`4.18 → 1.81 ms/check`) |
 | Stage 6 Final (`s6_v2`) | 60.98 ms | 66.03 ms | 92.4% | Tiled transpose-concat + warp `Q8_0` & coalesced conv `set-rows` + hoisted `s_slot_rev` + parallel `argmax` + zero-D2H `--backend-sampling` |
 | Stage 7 Final (`s7v2`) | 60.61 ms | 64.73 ms | 94.0% | Per-graph FP16 activation cache (`convert` −47%) + `float4` tiled multi-row `q8-small` (−37%) + `sm70_fa96 v6` double-buffered smem + adaptive KV padding + `k8v4` `Q4_0` V |
-| **Stage 8 Final (`s8i`)** | **57.54 ms** | **61.63 ms** | **93.4%** | **Multi-slot CUDA graph cache + Volta `BF16→FP16` Tensor Core GEMM + GPU grammar-rejection `--backend-sampling` + fused `ADD+RMS_NORM+MUL→f16` + ping-pong `q4k_skinny_gated→f16` + dual `q8_small` + direct `ssm_conv_direct_d4_f32` + `f16` DSpine draft KV** |
+| Stage 8 Final (`s8i`) | 57.54 ms | 61.63 ms | 93.4% | Multi-slot CUDA graph cache + Volta `BF16→FP16` Tensor Core GEMM + GPU grammar-rejection `--backend-sampling` + fused `ADD+RMS_NORM+MUL→f16` + ping-pong `q4k_skinny_gated→f16` + dual `q8_small` + direct `ssm_conv_direct_d4_f32` + `f16` DSpine draft KV |
+| **Stage 9 Final (`s9_final`)** | **47.96 ms** *(~46.0 w/ Wave 5)* | **49.21 ms** *(47.13 w/ Wave 5)* | **97.5%** | **Dynamic `7↔15` DSpine block hysteresis + 3-CTA/SM `q4k-skinny` & gated FFN + `WAVEFIX` (`n=6144` single-wave, `n=1024` 2× SMs) + `N5120_2CTA` (`32` warps/SM) + `BF16_CACHE` TC bypass (`m>=4`) + pinned-ring `ASYNC_SET` + `__ldg` `FA96`** |
 
 ---
 
@@ -96,12 +97,25 @@ Measured via `nsys --cuda-graph-trace=node` at 64K context (`n_draft = 15`, 16-t
 - **Stage 8E-3 — Fused Direct `ssm_conv_direct_d4_f32_kernel` (`ssm-conv.cuh/.cu`, `qwen35.cpp`, `ggml-cuda.cu`, `LLAMA_SM70_DIRECT_SSM_CONV=1`)**: Replaces `concat_dim0_src1_transposed` + `k_set_rows_chan_coalesced` + `ssm_conv_f32` across 47/48 GDN layers with a single 80-CTA coalesced register-window kernel — eliminating `109 MB/check` of intermediate `conv_input` HBM2 traffic and `7,144` launches (**−55%**, `0.927 → 0.415 ms/chk`).
 - **DSpine `f16` Draft KV (`--spec-draft-type-k f16 --spec-draft-type-v f16`)**: Eliminates `dequantize_block_q8_0_f16` (`0.378 → 0.000 ms/chk`) on the 5-layer drafter for `+78 MiB` VRAM.
 
+### 3.9 Stage 9 Optimizations (`s9_final`, −14.5 ms/check wall at 64K, +7–32% across Chat/Agent/Think/128K)
+- **Stage 9A — Dynamic `7 ↔ 15` DSpine Block Hysteresis (`common/speculative.cpp`, `LLAMA_SM70_DYN_BLOCK=1`)**: Tracks exact previous-step accepted count (`(pos0 - last_pos0) - 1`) per sequence before launching DSpine's parallel block forward pass. Starts at `n_draft = 7` (`m = 8`), promotes to `15` (`m = 16`) when all `7/7` draft tokens accept (`DYN_UP=7`), and demotes back to `7` when `< 6` accept (`DYN_DOWN=6, DYN_STREAK=1`). Shrinks both DSpine (`5` layers + shared `lm_head`) and target verify (`q4k-skinny` `RowTiles=1`, half-active `sm70_fa96`) on reasoning/long-context turns while riding `m = 16` bursts on tool calls & code (`Agent 12K: 198.0 → 206.1 tok/s`, `Agent 50K: 97.9 → 104.9 (pk 115.7)`, `Agent 100K: 85.9 → 91.9 (pk 105.3)`, `128K greedy: 43.38 → 52.70 tok/s`, `4K think: 62.55 → 82.56 tok/s`).
+- **Stage 9B — Zero-Spill 3-CTA/SM `q4k-skinny` & Gated FFN (`q4k-skinny.cu`, `LLAMA_SM70_SKINNY_3CTA=1`, `LLAMA_SM70_SKINNY_GNT_3CTA=1`)**: `cuobjdump` showed `Q5_K` and `Q6_K` (`RowTiles=1`, `SplitK=8`) sitting at `84–86` regs — just 4–6 regs above Volta's `80`-reg `3`-CTA/SM cliff. Adding `__launch_bounds__(256, 3)` dropped `Q4_K`/`Q5_K`/`Q6_K`/`IQ4_XS` to `REG: 68–79, STACK: 0` across `lm_head` and all 64 `ffn_gate/up` gated & mixed-quant layers (**24 warps/SM, `+50%` occupancy**).
+- **Stage 9C — Tail-Wave & Occupancy Fixes (`q4k-skinny.cu`, `LLAMA_SM70_SKINNY_WAVEFIX=1`, `LLAMA_SM70_SKINNY_N5120_2CTA=1`)**: `nsys` per-shape breakdown at `m = 8` revealed `ssm_in` (`n = 6144`, `96` CTAs @ `1` CTA/SM = 2 waves with 64 SMs idle on wave 2), `K/V` (`n = 1024`, only `16` CTAs = 20% of SMs), and `ffn_down`/`attn_out`/`ssm_out` (`n = 5120`, `8.72 ms/chk` at 16 warps/SM). Switching `n = 6144` to `NTiles=1, SplitK=8, MinBlocks=3` (`REG: 56–60, STACK: 0` = 4 CTAs/SM, 192 CTAs in **1 single wave**), `n = 1024` to `NTiles=1, SplitK=16` (`32` active SMs), and `n = 5120` to `NTiles=1, SplitK=16, MinBlocks=2` (`REG: 56–60, STACK: 0` = **32 warps/SM**) cut `64k_greedy` by another **−0.64 ms/check** (`47.69 → 47.13 ms/chk`, `70.27 tok/s`).
+- **Stage 9D — Cached `BF16 → F16` Weights + Tensor-Core Bypass of `mul_mat_vec_f` (`ggml-cuda.cu`, `LLAMA_SM70_BF16_CACHE=1`)**: Eliminates redundant per-step `convert<bf16, f16>` on DSpine's immutable `BF16` weights AND bypasses `ggml_cuda_should_use_mmvf` for `BF16` weights at `m >= 4` (where `MMVF_MAX_BATCH_SIZE = 8` had sent all 25 DSpine `BF16` GEMMs to scalar FP32 `mul_mat_vec_f` at `0.80 ms/chk`), saving **−0.64 ms/check** (`228/228` `MUL_MAT bf16` PASS).
+- **Stage 9E — Pinned-Ring Async H2D `set_tensor` (`ggml-cuda.cu`, `LLAMA_SM70_ASYNC_SET=1`)**: Stages `<= 256 KiB` non-weight H2D copies into a 4 MiB pinned host ring on the active compute stream (strictly stream-ordered with flush on reads/stream destruction), cutting GPU idle from **`4.09 → 1.25 ms/check`** (`97.5%` GPU busy).
+- **Stage 9F — L1-Coalesced `__ldg` in `sm70_fa96` (`fattn-sm70-q8-96.cu`, `LLAMA_SM70_FA96_LDG=1`)**: Replaces L1-bypassing `__ldcs` with `__ldg` on 34-byte `block_q8_0` KV loads so all 4 threads reading the shared 2-byte scale and overlapping unaligned words coalesce in Volta's 128 KB L1 (`REG: 165, STACK: 0`, **−0.60 ms/check** at 64K).
+
 ---
 
 ## 4. What We Tried & Reverted / Left Opt-In OFF (Lessons Learned)
 
 | Experiment | Measured Result | Why It Lost / Stayed Opt-In on Volta `sm_70` |
 |---|---|---|
+| `sm70_fa48_decode_kernel` (`LLAMA_SM70_FA48=1`, `Br=48`, 2 CTAs/SM, `48.4 KB` smem) | `48.60 ms/chk` vs `48.42 ms/chk` (`fa96_ldg`) at 64K | Shared `kv_s` (`<= 48 KB` for 2 CTAs/SM) still hit `STACK:16` at `REG:128` and lost double-buffered prefetch; `fa96` already skips inactive row-group 2 (`if (rows_here > 0)`) at `m=8` with `STACK:0`. Left opt-in OFF. |
+| `q4k_skinny_nt` `NTiles=4` (`LLAMA_SM70_SKINNY_NT4=1`, `m <= 8`) | `39.88` vs `39.33 ms/chk` (`3CTA`) | `REG:110–120` dropped occupancy from 3 → 2 CTAs/SM, outweighing 2× lower activation reads. Left opt-in OFF. |
+| `q4k_skinny_nt` `SplitK=8` on `n = 5120` (`LLAMA_SM70_SKINNY_SK8_M8=1`) | `40.81` vs `39.14 ms/chk` (`+1.67 ms` slower) | `n = 5120` with `NTiles=2` only has `80` CTAs (1/SM), so `SplitK=8` halved SM occupancy to 8 warps/SM; `N5120_2CTA` (`NTiles=1, SplitK=16`) instead doubled occupancy to 32 warps/SM. |
+| `FA96` `splits = 40` (`LLAMA_SM70_FA96_SPLITS=40`) | `57.28` vs `59.30 tok/s` at 64K | Stage 8's 20 splits (`80` CTAs = 1 full wave for 1-CTA/SM `fa96`) is already optimal. |
+| `DFlash2-Q4_0` & `DSpine-b16-Q8_0` drafters + `q8_0` draft KV | `141.7` / `150.0` vs `159.2 tok/s` (`DSpine-b16-Q4_K_M` + `f16` KV) | `DSpine-b16-Q4_K_M` + `f16` draft KV had higher acceptance (`6.24` vs `5.63`) and lower latency than all three alternatives. |
 | Naive `LLAMA_SM70_LAZY_BS=1` (Stage 7B) | `+3.4%` long prose, `-10.3%` short 12K tool turns | Detaching backend sampler mid-turn triggered `sched_need_reserve` (~50 ms) or discarded drafted tokens on `<tool_call>`. **Solved in Stage 8C-v2** via 1-token CPU grammar rejection + on-demand single-row VRAM fetch (**+7.5–10.5% on agent turns**). |
 | `LLAMA_SM70_CTX_LOOKUP=1` (Stage 7C) | `+5.5%` verbatim code copy (`311.9 → 329.2`, bit-exact), tie on novel prose | Lossless 16-token prompt-suffix lookup (`n_want <= 14`, skips stochastic `draft_q`). Left opt-in OFF by default. |
 | `DSpine-b16-Q8_0` drafter | `121.6` vs `125.9 tok/s`, `+900 MiB` VRAM | Extra draft bandwidth cost outweighed tiny acceptance gain. |

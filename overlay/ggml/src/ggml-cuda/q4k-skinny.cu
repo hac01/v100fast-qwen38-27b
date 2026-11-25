@@ -1103,9 +1103,8 @@ __global__ void q4k_skinny_kernel(
 // halves) to process one tile: at m = 16 the input bytes per CTA exceed the weight bytes and the input loads
 // are the largest cost (measured: 150 us -> 90 us on q4_K 17408x5120 when they are removed). Here a CTA takes
 // NTiles tiles and loads each sub-block's input fragments once for all of them.
-template <ggml_type T, int SplitK, int NAcc, int RowTiles, int NTiles>
-// at most 128 registers per thread, so that 16 warps fit one SM's register file for every codec
-__launch_bounds__(32 * SplitK, 512 / (32 * SplitK))
+template <ggml_type T, int SplitK, int NAcc, int RowTiles, int NTiles, int MinBlocks = (512 / (32 * SplitK))>
+__launch_bounds__(32 * SplitK, MinBlocks)
 __global__ void q4k_skinny_nt_kernel(
     const uint8_t * __restrict__ codes, const half * __restrict__ input,
     float * __restrict__ output, int n, int k, int m) {
@@ -1662,10 +1661,55 @@ static void q4k_skinny_mul_mat_launch_t(const uint8_t * codes, const half * inpu
         const char * e = getenv("LLAMA_SM70_SKINNY_NT");
         return e == nullptr || e[0] != '0';
     }();
+    static const bool nt4_on = [] {
+        const char * e = getenv("LLAMA_SM70_SKINNY_NT4");
+        return e && e[0] == '1';
+    }();
+    static const bool cta3_on = [] {
+        const char * e = getenv("LLAMA_SM70_SKINNY_3CTA");
+        return e && e[0] == '1';
+    }();
+    static const bool sk8_all = [] {
+        const char * e = getenv("LLAMA_SM70_SKINNY_SK8_M8");
+        return e && e[0] == '1';
+    }();
+    static const bool wavefix_on = [] {
+        const char * e = getenv("LLAMA_SM70_SKINNY_WAVEFIX");
+        return e && e[0] == '1';
+    }();
     if (nt_on && m >= 2 && n % 64 == 0) {
         if (m <= 8) {
-            if (config.split_k == 16 && n / 64 < 160) {
+            if (wavefix_on && (T == GGML_TYPE_Q4_K || T == GGML_TYPE_Q5_K || T == GGML_TYPE_Q6_K || T == GGML_TYPE_IQ4_XS)) {
+                if (n <= 2048 && config.split_k == 16) {
+                    // K/V projections (n=1024): 32 CTAs instead of 16 -> 2x active SMs!
+                    q4k_skinny_nt_kernel<T, 16, 1, 1, 1, 1><<<n / 32, 32 * 16, 0, stream>>>(codes, input, output, n, k, m);
+                    CUDA_CHECK(cudaGetLastError());
+                    return;
+                }
+                if (n / 64 > 80 && n / 64 < 160) {
+                    // ssm_in (n=6144): 192 CTAs @ 3 CTAs/SM -> 1 wave instead of 2 waves!
+                    q4k_skinny_nt_kernel<T, 8, 1, 1, 1, 3><<<n / 32, 32 * 8, 0, stream>>>(codes, input, output, n, k, m);
+                    CUDA_CHECK(cudaGetLastError());
+                    return;
+                }
+                static const bool n5120_2cta = [] {
+                    const char * e = getenv("LLAMA_SM70_SKINNY_N5120_2CTA");
+                    return e && e[0] == '1';
+                }();
+                if (n5120_2cta && n / 64 == 80 && config.split_k == 16) {
+                    // ffn_down / attn_out / ssm_out (n=5120): 160 CTAs @ 2 CTAs/SM (32 warps/SM, <=64 regs!)
+                    q4k_skinny_nt_kernel<T, 16, 1, 1, 1, 2><<<n / 32, 32 * 16, 0, stream>>>(codes, input, output, n, k, m);
+                    CUDA_CHECK(cudaGetLastError());
+                    return;
+                }
+            }
+            if (nt4_on && n % 128 == 0 && n / 128 >= 80 &&
+                (T == GGML_TYPE_Q4_K || T == GGML_TYPE_Q5_K || T == GGML_TYPE_Q6_K || T == GGML_TYPE_IQ4_XS)) {
+                q4k_skinny_nt_kernel<T, 8, 1, 1, 4, 2><<<n / 128, 32 * 8, 0, stream>>>(codes, input, output, n, k, m);
+            } else if (config.split_k == 16 && n / 64 < 160 && !sk8_all) {
                 q4k_skinny_nt_kernel<T, 16, 1, 1, 2><<<n / 64, 32 * 16, 0, stream>>>(codes, input, output, n, k, m);
+            } else if (cta3_on && (T == GGML_TYPE_Q4_K || T == GGML_TYPE_Q5_K || T == GGML_TYPE_Q6_K || T == GGML_TYPE_IQ4_XS)) {
+                q4k_skinny_nt_kernel<T, 8, 1, 1, 2, 3><<<n / 64, 32 * 8, 0, stream>>>(codes, input, output, n, k, m);
             } else {
                 q4k_skinny_nt_kernel<T, 8, 1, 1, 2><<<n / 64, 32 * 8, 0, stream>>>(codes, input, output, n, k, m);
             }
@@ -1746,9 +1790,8 @@ static void q4k_skinny_multi_mul_mat_launch(ggml_type type, const q4k_skinny_mul
 // The stock gated kernel runs the gate and the up projection as two phases, each streaming the whole input.
 // Here both weights of a tile go through one K loop: a sub-block's input fragments are loaded once and used for
 // the gate and the up records. Same split-K reduction order per projection, then silu(gate) * up.
-template <ggml_type T, int SplitK, int NAcc, int RowTiles>
-// at most 128 registers per thread, so that 16 warps fit one SM's register file for every codec
-__launch_bounds__(32 * SplitK, 512 / (32 * SplitK))
+template <ggml_type T, int SplitK, int NAcc, int RowTiles, int MinBlocks = (512 / (32 * SplitK))>
+__launch_bounds__(32 * SplitK, MinBlocks)
 __global__ void q4k_skinny_gated_nt_kernel(
     const uint8_t * __restrict__ gate_codes, const uint8_t * __restrict__ up_codes,
     const half * __restrict__ input, float * __restrict__ output, half * __restrict__ f16_out, int n, int k, int m) {
@@ -1945,9 +1988,16 @@ static void q4k_skinny_gated_mul_mat_launch_t(const uint8_t * gate_codes, const 
         const char * e = getenv("LLAMA_SM70_SKINNY_GNT_SK8");
         return e && e[0] == '1';
     }();
+    static const bool gnt_3cta = [] {
+        const char * e = getenv("LLAMA_SM70_SKINNY_GNT_3CTA");
+        return e && e[0] == '1';
+    }();
     if (nt_on && m >= 2) {
         if (m <= 8) {
-            if (config.split_k == 16 && !(gnt_sk8 && n / 32 >= 160)) {
+            if (gnt_3cta && n / 32 >= 160 &&
+                (T == GGML_TYPE_Q4_K || T == GGML_TYPE_Q5_K || T == GGML_TYPE_Q6_K || T == GGML_TYPE_IQ4_XS)) {
+                q4k_skinny_gated_nt_kernel<T, 8, 1, 1, 3><<<n / 32, 32 * 8, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
+            } else if (config.split_k == 16 && !(gnt_sk8 && n / 32 >= 160)) {
                 q4k_skinny_gated_nt_kernel<T, 16, 1, 1><<<n / 32, 32 * 16, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
             } else {
                 q4k_skinny_gated_nt_kernel<T, 8, 1, 1><<<n / 32, 32 * 8, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
@@ -1991,8 +2041,8 @@ static void q4k_skinny_gated_mul_mat_launch(ggml_type type, const uint8_t * gate
 
 // ---- mixed-quant gated pair, one pass (Stage 5, v100fast) ----
 // Fuses the 24 mixed-quant (gate_w->type != up_w->type) FFN layers of UD-Q4_K_XL in a single K loop.
-template <ggml_type TG, ggml_type TU, int SplitK, int RowTiles>
-__launch_bounds__(32 * SplitK, 512 / (32 * SplitK))
+template <ggml_type TG, ggml_type TU, int SplitK, int RowTiles, int MinBlocks = (512 / (32 * SplitK))>
+__launch_bounds__(32 * SplitK, MinBlocks)
 __global__ void q4k_skinny_gated_nt_mixed_kernel(
     const uint8_t * __restrict__ gate_codes, const uint8_t * __restrict__ up_codes,
     const half * __restrict__ input, float * __restrict__ output, half * __restrict__ f16_out, int n, int k, int m) {
@@ -2168,8 +2218,14 @@ static void q4k_skinny_gated_mixed_launch_t(const uint8_t * gate_codes, const ui
         const char * e = getenv("LLAMA_SM70_SKINNY_GNT_SK8");
         return e && e[0] == '1';
     }();
+    static const bool gnt_3cta = [] {
+        const char * e = getenv("LLAMA_SM70_SKINNY_GNT_3CTA");
+        return e && e[0] == '1';
+    }();
     if (m <= 8) {
-        if (config.split_k == 16 && !(gnt_sk8 && n / 32 >= 160)) {
+        if (gnt_3cta && n / 32 >= 160) {
+            q4k_skinny_gated_nt_mixed_kernel<TG, TU, 8, 1, 3><<<n / 32, 32 * 8, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
+        } else if (config.split_k == 16 && !(gnt_sk8 && n / 32 >= 160)) {
             q4k_skinny_gated_nt_mixed_kernel<TG, TU, 16, 1><<<n / 32, 32 * 16, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);
         } else {
             q4k_skinny_gated_nt_mixed_kernel<TG, TU, 8, 1><<<n / 32, 32 * 8, 0, stream>>>(gate_codes, up_codes, input, output, f16_out, n, k, m);

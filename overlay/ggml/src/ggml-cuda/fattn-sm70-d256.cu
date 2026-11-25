@@ -381,6 +381,25 @@ static bool sm70_fa96_enabled() {
     }();
     return on;
 }
+static bool sm70_fa48_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SM70_FA48");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+static int sm70_fa48_splits(int kv_len, int hkv) {
+    static const int env_s = [] {
+        const char * e = getenv("LLAMA_SM70_FA48_SPLITS");
+        return e ? atoi(e) : 0;
+    }();
+    if (env_s > 0) { return std::min(env_s, 128); }
+    // 2 CTAs/SM across 80 SMs = 160 CTAs (hkv=4 -> 40 splits!)
+    const int wave2 = std::max(1, 160 / std::max(1, hkv));
+    if (kv_len <= 1024) { return std::max(1, wave2 / 4); }
+    if (kv_len <= 4096) { return std::max(1, wave2 / 2); }
+    return wave2;
+}
 static int sm70_fa96_splits(int kv_len, int hkv) {
     static const int env_s = [] {
         const char * e = getenv("LLAMA_SM70_FA96_SPLITS");
@@ -563,15 +582,19 @@ static void ggml_cuda_flash_attn_ext_sm70_d256_decode(ggml_backend_cuda_context 
 
     const size_t f16_bytes = GGML_PAD((size_t) (f16_extra.end - (uintptr_t) base), 128);
     const bool use_fa96   = sm70_fa96_enabled();
-    const int splits      = use_fa96 ? sm70_fa96_splits(kv_len, hkv) : sm70_d256_dec_splits(kv_len, hkv);
+    const bool use_fa48   = use_fa96 && sm70_fa48_enabled() && (q_len * gqa <= sm70_fa96::kBr48);
+    const int splits      = use_fa48 ? sm70_fa48_splits(kv_len, hkv)
+                          : (use_fa96 ? sm70_fa96_splits(kv_len, hkv) : sm70_d256_dec_splits(kv_len, hkv));
     const int rows_total  = (int) (hkv * gqa * q_len);
     float * partial_acc = (float *) (base + f16_bytes);
     float * partial_m   = partial_acc + (int64_t) splits * rows_total * SM70_D256_D;
     float * partial_l   = partial_m + (int64_t) splits * rows_total;
 
-    const int n_row_passes = use_fa96
-        ? (q_len * gqa + sm70_fa96::kBr - 1) / sm70_fa96::kBr
-        : (q_len * gqa + sm70_d256_decode::kDecBr - 1) / sm70_d256_decode::kDecBr;
+    const int n_row_passes = use_fa48
+        ? (q_len * gqa + sm70_fa96::kBr48 - 1) / sm70_fa96::kBr48
+        : (use_fa96
+            ? (q_len * gqa + sm70_fa96::kBr - 1) / sm70_fa96::kBr
+            : (q_len * gqa + sm70_d256_decode::kDecBr - 1) / sm70_d256_decode::kDecBr);
     const dim3 grid(hkv * n_row_passes, splits);
     const int64_t q_row = Q->nb[1] / sizeof(float);
     const int64_t q_head = Q->nb[2] / sizeof(float);
@@ -581,7 +604,12 @@ static void ggml_cuda_flash_attn_ext_sm70_d256_decode(ggml_backend_cuda_context 
     const bool mask_md_dec = sm70_maskmd(K, V, mask);
     // Always pass mask_kv so non-MaskMD mode can check exact mask on tail tokens (DSpine bidirectional blocks)
     const half * mask_kv = (const half *) mask->data;
-    if (use_fa96) {
+    if (use_fa48) {
+        sm70_fa96::launch_sm70_fa48_decode(gqa, k_mode, v_mode, mask_md_dec, grid, stream,
+            (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
+            q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l,
+            mask_kv, mask_kv_stride);
+    } else if (use_fa96) {
         sm70_fa96::launch_sm70_fa96_decode(gqa, k_mode, v_mode, mask_md_dec, grid, stream,
             (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
             q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l,
@@ -822,7 +850,14 @@ size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
             const size_t f16_extra_size = (size_t) (f16_extra.end - ((uintptr_t) dst->data + ggml_nbytes(dst)));
             const int hkv = (int) K->ne[2];
             const int64_t rows_total = (int64_t) Q->ne[2] * Q->ne[1];
-            const int64_t partials = (int64_t) sm70_d256_dec_split_cap(hkv) * rows_total
+            int split_cap = sm70_d256_dec_split_cap(hkv);
+            if (sm70_fa96_enabled()) {
+                split_cap = std::max(split_cap, sm70_fa96_splits((int) K->ne[1], hkv));
+                if (sm70_fa48_enabled()) {
+                    split_cap = std::max(split_cap, sm70_fa48_splits((int) K->ne[1], hkv));
+                }
+            }
+            const int64_t partials = (int64_t) split_cap * rows_total
                                    * (SM70_D256_D + 2) * sizeof(float);
             return ggml_nbytes(dst) + GGML_PAD(f16_extra_size, 128) + GGML_PAD(partials, 128);
         }
