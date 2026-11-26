@@ -209,8 +209,15 @@ void ggml_cuda_gdn_chunk_sm70(ggml_backend_cuda_context & ctx, const ggml_cuda_g
     }
     CUDA_CHECK(cudaGetLastError());
 
+    static const bool gdn_h48_on = [] {
+        const char * e = getenv("LLAMA_SM70_GDN_H48");
+        return e && e[0] == '1';
+    }();
     if (H == 12 && Hk == 4) {
         gdn_chunk_launch_kkt_fwd<12, 4>(a.get(), args, chunk_indices, chunk_offsets, cu_seqlens, gcum.get(),
+            k16.get(), o16.get(), q16.get(), v16.get(), num_chunks, (int) n, H, Hk, stream);
+    } else if (gdn_h48_on && H == 48 && Hk == 16) {
+        gdn_chunk_launch_kkt_fwd<48, 16>(a.get(), args, chunk_indices, chunk_offsets, cu_seqlens, gcum.get(),
             k16.get(), o16.get(), q16.get(), v16.get(), num_chunks, (int) n, H, Hk, stream);
     } else {
         gdn_chunk_launch_kkt_fwd<0, 0>(a.get(), args, chunk_indices, chunk_offsets, cu_seqlens, gcum.get(),

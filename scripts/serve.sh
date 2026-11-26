@@ -77,7 +77,7 @@ if [ "${PL:-0}" -gt 0 ] && command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 
-# Stage 9 Volta sm_70 kernel & dynamic-block flags (all strictly lossless; override any to 0 to disable)
+# Stage 9 Volta sm_70 decode & dynamic-block flags (all strictly lossless; override any to 0 to disable)
 export LLAMA_SM70_FA96="${LLAMA_SM70_FA96:-1}"
 export LLAMA_SM70_FA96_LDG="${LLAMA_SM70_FA96_LDG:-1}"
 export LLAMA_SM70_GDN_CHUNK="${LLAMA_SM70_GDN_CHUNK:-1}"
@@ -89,6 +89,14 @@ export LLAMA_SM70_SKINNY_GNT_3CTA="${LLAMA_SM70_SKINNY_GNT_3CTA:-1}"
 export LLAMA_SM70_SKINNY_WAVEFIX="${LLAMA_SM70_SKINNY_WAVEFIX:-1}"
 export LLAMA_SM70_SKINNY_N5120_2CTA="${LLAMA_SM70_SKINNY_N5120_2CTA:-1}"
 export LLAMA_SM70_DYN_BLOCK="${LLAMA_SM70_DYN_BLOCK:-1}"
+
+# Stage 9.1 Volta sm_70 prefill flags (all strictly lossless; override any to 0 to disable)
+export LLAMA_SM70_PREFILL_BC128="${LLAMA_SM70_PREFILL_BC128:-2}"
+export LLAMA_SM70_GDN_H48="${LLAMA_SM70_GDN_H48:-1}"
+export LLAMA_SM70_DIRECT_SSM_PREFILL="${LLAMA_SM70_DIRECT_SSM_PREFILL:-1}"
+export LLAMA_SM70_PF_ACT_CACHE="${LLAMA_SM70_PF_ACT_CACHE:-1}"
+export LLAMA_SM70_SWIGLU_VEC4="${LLAMA_SM70_SWIGLU_VEC4:-1}"
+export LLAMA_SM70_FAST_D2H="${LLAMA_SM70_FAST_D2H:-1}"
 
 EXTRA_ARGS=()
 if [ -n "$API_KEY_FILE" ]; then

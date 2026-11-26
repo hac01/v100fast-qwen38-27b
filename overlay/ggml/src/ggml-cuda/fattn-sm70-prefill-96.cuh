@@ -30,4 +30,26 @@ void launch_sm70_prefill96(
         int q_len, int kv_len, int hq, int gqa, float scale,
         const half * mask_last_q, int64_t mask_q_stride,
         const half * mask_kv, int64_t mask_kv_stride);
+
+void launch_sm70_prefill_bc128(
+        bool mask_md,
+        cudaStream_t stream,
+        const float * q, int64_t q_row, int64_t q_head,
+        const half * k, const half * v,
+        int64_t k_row, int64_t k_head, int64_t v_row, int64_t v_head,
+        float * out, int64_t o_row, int64_t o_head,
+        int q_len, int kv_len, int hq, int gqa, float scale,
+        const half * mask_last_q, int64_t mask_q_stride,
+        const half * mask_kv, int64_t mask_kv_stride);
+
+void launch_sm70_prefill_br128_bc128(
+        bool mask_md,
+        cudaStream_t stream,
+        const float * q, int64_t q_row, int64_t q_head,
+        const half * k, const half * v,
+        int64_t k_row, int64_t k_head, int64_t v_row, int64_t v_head,
+        float * out, int64_t o_row, int64_t o_head,
+        int q_len, int kv_len, int hq, int gqa, float scale,
+        const half * mask_last_q, int64_t mask_q_stride,
+        const half * mask_kv, int64_t mask_kv_stride);
 } // namespace sm70_prefill96

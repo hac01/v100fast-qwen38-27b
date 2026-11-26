@@ -105,6 +105,26 @@ Measured via `nsys --cuda-graph-trace=node` at 64K context (`n_draft = 15`, 16-t
 - **Stage 9E — Pinned-Ring Async H2D `set_tensor` (`ggml-cuda.cu`, `LLAMA_SM70_ASYNC_SET=1`)**: Stages `<= 256 KiB` non-weight H2D copies into a 4 MiB pinned host ring on the active compute stream (strictly stream-ordered with flush on reads/stream destruction), cutting GPU idle from **`4.09 → 1.25 ms/check`** (`97.5%` GPU busy).
 - **Stage 9F — L1-Coalesced `__ldg` in `sm70_fa96` (`fattn-sm70-q8-96.cu`, `LLAMA_SM70_FA96_LDG=1`)**: Replaces L1-bypassing `__ldcs` with `__ldg` on 34-byte `block_q8_0` KV loads so all 4 threads reading the shared 2-byte scale and overlapping unaligned words coalesce in Volta's 128 KB L1 (`REG: 165, STACK: 0`, **−0.60 ms/check** at 64K).
 
+### 3.10 Stage 9.1 Prefill Optimizations (`br128_v4 + W1`, +9.6% @ 64K, +11.8% @ 100K, +13.1% @ 128K / −22.7 s, plus Causal-Mask Bug Fix)
+- **Root Cause (`ncu` + `nsys` at 12K / 64K)**:
+  - At 12K, cuBLAS `H884` FP16 GEMMs are `66.2%` of GPU time at `81.3 TFLOPS` (~86% of V100's 220 W ceiling) and `qskinny_to_f16_kernel` (`4.9%`) saturates HBM2 at `805 GB/s`. At 64K–128K, FlashAttention dominates (`41% → 62%` of total time).
+  - `ncu` on `sm70_d256_splitd_dense_kernel` (`kv=6K`) revealed DRAM was only `11.95%` (`L2 hit = 90.1%`); the bottleneck was **`L1/TEX = 72.6%` (`mio_throttle = 24.33%`)** from `383.7M` SMEM load wavefronts (`8×32` warp tiles), `51.4M` SMEM bank conflicts (`31.7M` load + `19.8M` store), and `12` `__syncthreads()` per `Bc=32` tile — capping HMMA active cycles at `37.50%`.
+  - **Upstream Accuracy Bug Found**: `sm70_d256_splitd_dense_kernel` received `q_pad` (multiple of 64) as `query_len` and computed `kv_offset = lo - query_len`. Whenever a prompt's final chunk was not a multiple of 64 tokens (`q_len % 64 != 0`), it shifted the causal mask by `q_pad - q_len` tokens (e.g., `0.79–1.12` logprob corruption on `P_EXACT` `q_len=263` and a 48-token shift on 12K agent `prompt_read=12176`).
+- **Stage 9.1A — `sm70_prefill_br128_bc64_kernel` v4 (`fattn-sm70-prefill-96.cu/.cuh`, `fattn-sm70-d256.cu`, `LLAMA_SM70_PREFILL_BC128=2`)**:
+  - `Br=128, Bc=64, D=256`, 8 warps (256 threads), **`REG: 246, STACK: 0`**, `97,536 B <= 98,304 B` dynamic SMEM (`cudaFuncAttributePreferredSharedMemoryCarveout=100`), with fallback to `sm70_prefill_bc128_kernel` (`Br=64, Bc=128`, `REG: 200, STACK: 0`) for `256 <= q_len < 512`.
+  - Each warp covers **`64` Q rows** (`2×32` row-halves) × `16` K cols (`QK^T`) / `64` D cols (`PV`), reusing every K/V SMEM load twice (**−45% SMEM load wavefronts**: `383.7M → 211.0M`).
+  - Constant-stride padded SMEM (`sQ[128][264]`, `sK[64][72]`, `sV[16][264]`) achieves **`0` SMEM load bank conflicts** (down from `31.7M`), `~0` store conflicts (`3.4K` vs `19.8M`), and eliminates runtime swizzle ops (`LOP3: 514 → 61`, `IMAD: 743 → 362`).
+  - Dead-region double-buffering (`sk_buf1` aliases `p_s` during `QK^T`; `sv_buf1` aliases `stat_s + sum_s + pad + p_s[sw=0]` during `PV`) cuts barriers from `16 → 11` per `Bc=64` tile, paired with software-pipelined `k0/k1` `HMMA.884` interleaving and double-buffered `LDS` in `PV`.
+  - Passes true `q_len` (fixing the upstream causal-mask bug; `exact_text_match = True`, top-1 logprob diff `0.001–0.005` vs stock `llama.cpp` `FLASH_ATTN_EXT`, and exact `94` tok / `74/181` draft match on 12K agent turn 0).
+  - Skips `216 MiB` of unused `Qs/Os/SplitKV3` scratch in `ggml_cuda_sm70_d256_alloc_size()` (net peak VRAM stays `31,314–31,338 MiB` at `-c 229376`).
+  - **`ncu` (`kv=6K` launch)**: Duration **`7.00 → 5.55 ms` (−20.7%)**, `HMMA` active **`37.50% → 50.79%` (+35.4%)**, `mio_throttle` **`24.33% → 7.35%`**, `barrier` **`7.63% → 6.04%`**.
+- **Stage 9.1B — 5 Supporting Lossless Prefill Optimizations (`0.000000` logprob diff vs `br128_v4` alone)**:
+  - `LLAMA_SM70_GDN_H48=1` (`gdn-chunk-sm70.cu`): Compile-time `<48, 16>` TileLang GDN chunk specialization (`1,428 → 1,269 us`, **−11.1%**).
+  - `LLAMA_SM70_DIRECT_SSM_PREFILL=1` (`ssm-conv.cu`): Extends direct `ssm_conv` to `n_t <= 8192` using in-place `BLOCK_C=32` (`320` CTAs, coalesced 128 B lines) for `ggml-alloc`-aliased tensors + 2D-tiled `ssm_conv_direct_d4_prefill_f32_kernel<128, 128>` for out-of-place tensors (`75/75` `SSM_CONV` + `GLU` PASS).
+  - `LLAMA_SM70_PF_ACT_CACHE=1` (`common.cuh`, `ggml-cuda.cu`, `norm.cu`, `unary.cu`): Lazy `try_ensure_f16_act_buf(160 MiB)` (with `48 MiB → 2 MiB` graceful fallback, never OOMs) + `f16_act_gen` generation-guarded invalidation; cuts `convert_unary_cont_vec4` **`49.5 → 6.5 ms/chunk` (−87%)**.
+  - `LLAMA_SM70_SWIGLU_VEC4=1` (`unary.cu`): `float4` vectorized `unary_gated_op_vec4_f32_kernel<op, WRITE_F16>` eliminating 64-bit `i/n` div/mod and writing FP16 directly to `f16_act_buf` (`45.2 → 36.7 ms/chunk` + zero `down_proj` F16 convert).
+  - `LLAMA_SM70_FAST_D2H=1` (`batch-copy.cu`): Bypasses `cudaHostRegister` (`60–127 ms` kernel page-pinning stall per checkpoint) on `>16 MiB` D2H copies, keeping `--ctx-checkpoints 8` 100% functional with `0` `cudaHostRegister` calls in `nsys`.
+
 ---
 
 ## 4. What We Tried & Reverted / Left Opt-In OFF (Lessons Learned)
@@ -123,3 +143,6 @@ Measured via `nsys --cuda-graph-trace=node` at 64K context (`n_draft = 15`, 16-t
 | Fused `gdn_prologue` (`l2_norm` inside GDN) | `75.0 → 86.3 us`, `130.9 → 129.7 tok/s` | Raised register pressure `89 → 110`, halving CTA occupancy from 2 to 1 CTA/SM. |
 | `sm70_prefill96` (`Bc=32` prefill FA) | `27.72 s` vs `22.05 s` @ 64K prefill | `Bc=32` doubled softmax/`exp2f`/barrier frequency vs `splitd_dense` (`Bc=64`) and redundantly dequantized `Q8_0` per Q-head. Left opt-in OFF (`LLAMA_SM70_PREFILL_V2=0`). |
 | `FA96` coalesced `LDG.E.64` + `SHFL` (`v5e/f/i`) | `743–764 us` vs `708 us` (`v5d`) @ 64K | `SHFL` in `commit_q8_row` contended on Volta's MIO pipe with `LDS`/`STS`. |
+| `FA_L2SWIZZLE` grid reorder on `splitd_dense` | `−0.6%` at 64K | `splitd_dense` already had `90.1%` L2 hit rate and was SMEM/MIO-bound (`L1/TEX 72.6%`), not DRAM-bound (`11.95%`). Reverted cleanly. |
+| `Br=128, Bc=128` prefill FA draft | `STACK: 216` spills | Holding `acc_f[2][8][8]` (128 regs) + `acc_s[2][4][8]` (64 regs) + `p_my[2][4][4]` (32 regs) spilled 54 regs. Replaced by spill-free `Br=128, Bc=64` (`REG: 246, STACK: 0`). |
+| `-ub 4096` at `-c 229376` | OOM (`4,322 MiB` compute buffer vs `~1.5 GiB` free VRAM) | Keep `-b 2048 -ub 2048` at `-c 229376` on 32 GB V100. |

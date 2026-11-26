@@ -43,8 +43,14 @@ echo "=== 10/12 ARGMAX ==="
 echo "=== 11/12 SET_ROWS ==="
 "$TBO" test -b CUDA0 -o SET_ROWS | tail -n 5
 
-echo "=== 12/12 CONCAT ==="
+echo "=== 12/14 CONCAT ==="
 "$TBO" test -b CUDA0 -o CONCAT | tail -n 5
 
+echo "=== 13/14 GLU (Stage 9.1 SWIGLU_VEC4 + PF_ACT_CACHE) ==="
+LLAMA_SM70_SWIGLU_VEC4=1 LLAMA_SM70_PF_ACT_CACHE=1 "$TBO" test -b CUDA0 -o GLU | tail -n 5
+
+echo "=== 14/14 SSM_CONV (Stage 9.1 DIRECT_SSM_PREFILL) ==="
+LLAMA_SM70_DIRECT_SSM_PREFILL=1 "$TBO" test -b CUDA0 -o SSM_CONV | tail -n 5
+
 echo ""
-echo "ALL STAGE 9 KERNEL VERIFICATION GATES PASSED!"
+echo "ALL STAGE 9.1 KERNEL VERIFICATION GATES PASSED!"

@@ -1,6 +1,6 @@
 # v100fast-qwen38-27b
 
-**Make Qwen3.8-27B + DSpine fly on a single NVIDIA Tesla V100 (`sm_70`, 32 GB) — `130 tok/s` chat, `175–182 tok/s` code, `206 tok/s` at 12K agent context, `105 tok/s` (`115.7` peak) at 50K context, and `92 tok/s` (`105.3` peak) at 100K context, with zero quality loss (`UD-Q4_K_XL` + `q8_0` target KV cache).**
+**Make Qwen3.8-27B + DSpine fly on a single NVIDIA Tesla V100 (`sm_70`, 32 GB) — `128–130 tok/s` chat, `175–182 tok/s` code, `174–206 tok/s` at 12K agent context, `105–133 tok/s` at 50K context, `92–94 tok/s` (`110.9` peak) at 100K context, and `1,102 / 976 / 826 / 759 tok/s` prompt prefill at `12K / 50K / 100K / 128K`, with zero quality loss (`UD-Q4_K_XL` + `q8_0` target KV cache).**
 
 All numbers below were measured on a single **Tesla V100-PCIE-32GB** capped at **220 W** (`ECC ON`, `0` uncorrected ECC) with `Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL.gguf` + `Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf` (`-c 229376 -ub 2048 -ctk q8_0 -ctv q8_0 --spec-draft-type-k f16 --spec-draft-type-v f16 --backend-sampling`).
 
@@ -19,7 +19,8 @@ All numbers below were measured on a single **Tesla V100-PCIE-32GB** capped at *
 | **Deep-Think (`4K` / `64K` / `128K`)** | — | — | — | 62.6 / 55.4 / 43.4 tok/s | **82.6 / 63.5–70.9 / 52.7 tok/s** | **+32% / +15–28% / +21.5% vs s8** |
 | **64K `nsys` Decode** | — | — | 59.8 tok/s | 63.9 tok/s | **75.9 tok/s** *(+18.8% vs s8)* | — |
 | **64K Verify Step (GPU / wall)** | ~125 / ~130 ms | 60.98 / 66.03 ms *(92%)* | 60.61 / 64.73 ms *(94%)* | 57.54 / 61.63 ms *(93%)* | **47.96 / 49.21 ms** *(**97.5%** busy; 47.1 ms w/ Wave 5)* | **2.76× (−63.8% wall)** |
-| **Prompt Read (12K / 50K / 100K)** | 898 / 709 / — tok/s | 1,080 / 874 / 628 tok/s | 1,083 / 875 / 628 tok/s | 1,071 / 872 / 627 tok/s | **1,070 / 872 / 627 tok/s** | **+19% / +23%** |
+| **Prompt Read (12K / 50K / 100K)** | 898 / 709 / — tok/s | 1,080 / 874 / 628 tok/s | 1,083 / 875 / 628 tok/s | 1,071 / 872 / 627 tok/s | **1,102 / 976 / 826 tok/s** *(Stage 9.1 cold full-prompt)* | **+22.7% / +37.6% / +31.8% vs s8** |
+| **Prefill Iso-Thermal (`12K / 64K / 100K / 128K`)** | — | — | — | 1,098 / 862 / 743 / 671 tok/s *(Stage 9 base)* | **1,134 / 944 / 830 / 759 tok/s** *(−22.7 s @ 128K)* | **+3.3% / +9.6% / +11.8% / +13.1%** |
 | **155K Live Coding Session** | — | 55.2 – 66.6 tok/s | — | — | — | — |
 | **196K Stress Test** | — | 550.3 pp / 37.5 tg (`31,058 MiB`) | — | — | — | — |
 | **Verbatim Code Copy** *(opt-in `LLAMA_SM70_CTX_LOOKUP=1`)* | — | 311.9 tok/s *(DSpine only)* | 329.2 tok/s *(bit-exact)* | — | — | **+5.5% over DSpine** |
@@ -133,6 +134,12 @@ Every optimization is bit-exact or passes full `test-backend-ops` tolerances and
     - **`LLAMA_SM70_BF16_CACHE=1`** (`ggml-cuda.cu`): Permanently caches immutable `BF16 → F16` weights once at load and bypasses scalar `mul_mat_vec_f` for `BF16` weights at `m >= 4` so DSpine's `25` `BF16` GEMMs always hit Volta FP16 Tensor Cores (`228/228` `MUL_MAT bf16` PASS).
     - **`LLAMA_SM70_ASYNC_SET=1`** (`ggml-cuda.cu`): 4 MiB pinned-ring async H2D `set_tensor` ordered on the active compute stream (with clean stream-destroy flush), cutting GPU idle gaps from **`4.09 → 1.25 ms/check`** (`97.5%` GPU busy).
     - **`LLAMA_SM70_FA96_LDG=1`** (`fattn-sm70-q8-96.cu`): L1-coalesced `__ldg` loads for 34-byte `block_q8_0` KV tiles (`REG:165, STACK:0`, **`−0.60 ms/chk`** at 64K).
+11. **Stage 9.1 — Lossless Volta Prefill Engine (`+9.6%` @ 64K, `+11.8%` @ 100K, `+13.1%` / `−22.7 s` @ 128K + Causal-Mask Bug Fix)**
+    - **`LLAMA_SM70_PREFILL_BC128=2`** (`fattn-sm70-prefill-96.cu/.cuh`, `fattn-sm70-d256.cu`): New **`sm70_prefill_br128_bc64_kernel` v4** (`Br=128, Bc=64, D=256`, `REG:246, STACK:0`, `97,536 B` SMEM, fallback to `Br=64, Bc=128` for `256 <= q_len < 512`). Constant-stride padded SMEM (`0` load bank conflicts vs `31.7M`), `2×` K/V reuse (`−45%` SMEM load wavefronts), and dead-region double-buffering (`16 → 11` barriers/tile) cut `ncu` kernel duration **`7.00 → 5.55 ms` (−20.7%)** and lift `HMMA` active cycles **`37.5% → 50.8%`** (`mio_throttle`: `24.3% → 7.4%`), while skipping `216 MiB` of unused `Qs/Os/SplitKV3` scratch. **Also fixes an upstream `lo - q_pad` causal-mask shift bug** in `sm70_d256_splitd_dense_kernel` whenever a final prefill chunk is not a multiple of 64 tokens (restoring exact parity with stock `llama.cpp` `FLASH_ATTN_EXT`).
+    - **`LLAMA_SM70_GDN_H48=1`** (`gdn-chunk-sm70.cu`): Compile-time `<48, 16>` TileLang GDN chunk specialization (**−11.1%**, `1,428 → 1,269 us`).
+    - **`LLAMA_SM70_DIRECT_SSM_PREFILL=1`** (`ssm-conv.cu`): Extends direct `ssm_conv` to `n_t <= 8192` (in-place `BLOCK_C=32` `320`-CTA coalesced + 2D-tiled out-of-place).
+    - **`LLAMA_SM70_PF_ACT_CACHE=1` + `LLAMA_SM70_SWIGLU_VEC4=1`** (`common.cuh`, `ggml-cuda.cu`, `norm.cu`, `unary.cu`): Lazy generation-guarded prefill FP16 activation cache + `float4` SwiGLU direct FP16 output, cutting `convert_unary_cont_vec4` **−87%** (`49.5 → 6.5 ms/chunk`).
+    - **`LLAMA_SM70_FAST_D2H=1`** (`batch-copy.cu`): Bypasses `cudaHostRegister` (`60–127 ms` page-pinning stall/checkpoint) on `>16 MiB` D2H copies while keeping `--ctx-checkpoints 8` 100% intact.
 
 ---
 
@@ -151,6 +158,12 @@ Every optimization is bit-exact or passes full `test-backend-ops` tolerances and
 | `LLAMA_SM70_SKINNY_WAVEFIX` | `0` *(set `1` in `serve.sh`)* | Single-wave 4-CTA/SM `n=6144` (`ssm_in`) + 2× SMs on `n=1024` (`K/V`) (Stage 9) |
 | `LLAMA_SM70_SKINNY_N5120_2CTA` | `0` *(set `1` in `serve.sh`)* | 2-CTA/SM (`32` warps/SM, `STACK:0`) on `n=5120` (`ffn_down`/`attn_out`/`ssm_out`) (Stage 9) |
 | `LLAMA_SM70_DYN_BLOCK` | `0` *(set `1` in `serve.sh`)* | Lossless dynamic `7 ↔ 15` DSpine block-size hysteresis (`DYN_UP=7, DYN_DOWN=6, DYN_STREAK=1`) (Stage 9) |
+| `LLAMA_SM70_PREFILL_BC128` | `0` *(set `2` in `serve.sh`)* | Volta `Br=128, Bc=64, D=256` padded-SMEM double-buffered prefill FA + upstream causal-mask fix (Stage 9.1) |
+| `LLAMA_SM70_GDN_H48` | `0` *(set `1` in `serve.sh`)* | Compile-time `<48, 16>` TileLang GDN chunk specialization (Stage 9.1) |
+| `LLAMA_SM70_DIRECT_SSM_PREFILL` | `0` *(set `1` in `serve.sh`)* | Direct `ssm_conv` prefill up to `n_t <= 8192` (in-place `BLOCK_C=32` + 2D-tiled out-of-place, Stage 9.1) |
+| `LLAMA_SM70_PF_ACT_CACHE` | `0` *(set `1` in `serve.sh`)* | Lazy generation-guarded prefill FP16 activation cache (`−87%` `convert_unary_cont_vec4`, Stage 9.1) |
+| `LLAMA_SM70_SWIGLU_VEC4` | `0` *(set `1` in `serve.sh`)* | `float4` SwiGLU writing FP16 directly to `f16_act_buf` (Stage 9.1) |
+| `LLAMA_SM70_FAST_D2H` | `0` *(set `1` in `serve.sh`)* | Bypass `>16 MiB` `cudaHostRegister` page-pinning stalls on `--ctx-checkpoints` D2H copies (Stage 9.1) |
 | `LLAMA_SM70_MULTI_GRAPH` | `1` (ON) | 8-slot shape-keyed CUDA graph cache (Stage 8A) |
 | `LLAMA_SM70_BF16_AS_F16` | `1` (ON) | Route Volta `BF16` GEMM through FP16 Tensor Cores w/ FP32 acc (Stage 8B) |
 | `LLAMA_SM70_LAZY_BS` | `1` (ON) | GPU grammar-rejection `--backend-sampling` w/ on-demand 1-row fetch (Stage 8C-v2) |
@@ -180,8 +193,8 @@ Verified passing on Tesla V100-PCIE-32GB (CUDA 12.8):
 - `GET_ROWS`: **228/228 PASS**
 - `FLASH_ATTN_EXT` `hsk=256` (`FA96=1`, incl. `Q8/Q4` & `Q4/Q4`): **249/249 PASS** on both `TEST_FA_CAUSAL=1` and `TEST_FA_CAUSAL=2`
 - `GATED_DELTA_NET` (`REPLAY=1, CHUNK=0`): **63/63 PASS**
-- `ARGMAX`: **7/7 PASS** | `SET_ROWS`: **191/191 PASS** | `CONCAT`: **221/221 PASS**
-- Output parity vs Stage 7 (`s7v2`): `12K: head=15/15 (sha=10/15, 5 random tool-call UUIDs)`, `50K: head=4/4`, `100K: head=4/4`
+- `ARGMAX`: **7/7 PASS** | `SET_ROWS`: **191/191 PASS** | `CONCAT`: **221/221 PASS** | `GLU` + `SSM_CONV` (`Stage 9.1`): **75/75 PASS**
+- Ground-truth prefill parity vs stock `llama.cpp` `FLASH_ATTN_EXT` (`LLAMA_SM70_D256=0`): `exact_text_match = True`, top-1 logprob diff `0.001–0.005` (`P12K`, `P_EXACT` `q_len=263`), exact `94` tok / `74/181` draft match on 12K agent turn 0; `0.000000` logprob diff between `PREFILL_BC128=2` alone and all 6 Stage 9.1 flags ON.
 
 ---
 

@@ -73,23 +73,21 @@ __global__ void sm70_d256_stage_q_kernel(
     const int r  = blockIdx.x;
     const int bj = blockIdx.y;          // b*hkv + j
     const int c  = blockIdx.z;          // Q head within the KV group
-    if (r >= q_len) {
-        return;                         // pad rows: pre-zeroed scratch
-    }
     const int j = bj % hkv;
     const int b = bj / hkv;
     const int head_q = j * gqa + c;     // GLOBAL Q head index (0..heads_q-1)
     const int heads_q = hkv * gqa;      // 24
-    // Q source layout is (D, q_len, heads, batch): head index = head_q, NOT c.
-    const float2 v = src[threadIdx.x
+    const half2 out_v = (r < q_len)
+        ? __float22half2_rn(src[threadIdx.x
                    + (int64_t) r * src_row
                    + (int64_t) head_q * src_head
-                   + (int64_t) b * src_seq];
+                   + (int64_t) b * src_seq])
+        : __float22half2_rn(make_float2(0.0f, 0.0f));
     // Qs layout (kernel reads [b][head_q][q_pad][D]): batch-major.
     dst[threadIdx.x
       + (int64_t) b * heads_q * (gridDim.x * 128)
       + (int64_t) head_q * (gridDim.x * 128)
-      + (int64_t) r * 128] = __float22half2_rn(v);
+      + (int64_t) r * 128] = out_v;
 }
 
 // Output scatter: staged [hkv][gqa][nb][rows][256] f32 -> stock f32 dst.
@@ -882,6 +880,13 @@ size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
     // f16_extra size = bytes beyond the output data (base = dst->data + nbytes)
     const size_t f16_extra_size = (size_t) (f16_extra.end - ((uintptr_t) dst->data + ggml_nbytes(dst)));
 
+    static const int prefill_bc128_alloc = [] {
+        const char * e = getenv("LLAMA_SM70_PREFILL_BC128");
+        return e ? atoi(e) : 0;
+    }();
+    if (prefill_bc128_alloc > 0 && Q->ne[3] == 1 && !k_direct && !v_direct) {
+        return ggml_nbytes(dst) + GGML_PAD(f16_extra_size, 128);
+    }
     const int q_pad = (((int) Q->ne[1] + SM70_D256_BLOCK_M - 1) / SM70_D256_BLOCK_M) * SM70_D256_BLOCK_M;
     const int64_t nQ = (int64_t) Q->ne[2] * q_pad * SM70_D256_D * (int) Q->ne[3]; // elems
     // SplitKV3 partials (worst case): 3 x (q_pad*heads*nb) rows of f32 D
@@ -1005,9 +1010,16 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     half * Qs = (half *) Qs_bytes;
     float * Os = (float *) (Qs_bytes + (size_t) nQ * sizeof(half));
 
-    // zero pad rows of Qs (their outputs are never scattered back) and all of Os
-    CUDA_CHECK(cudaMemsetAsync((void *) Qs_bytes, 0,
-        (size_t) nQ * sizeof(half) + (size_t) nQ * sizeof(float), ctx.stream()));
+    static const int prefill_bc128_mode = [] {
+        const char * e = getenv("LLAMA_SM70_PREFILL_BC128");
+        return e ? atoi(e) : 0;
+    }();
+    const bool use_bc128 = (prefill_bc128_mode > 0) && nb == 1 && !k_direct && !v_direct;
+    if (!use_bc128) {
+        // zero pad rows of Qs (their outputs are never scattered back) and all of Os
+        CUDA_CHECK(cudaMemsetAsync((void *) Qs_bytes, 0,
+            (size_t) nQ * sizeof(half) + (size_t) nQ * sizeof(float), ctx.stream()));
+    }
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
@@ -1059,6 +1071,39 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         // 8/23 fix: same [ne1][ne2][ne0] position-major layout as K above.
         v_row_stride   = (int64_t) V->ne[2] * V->ne[0];
         v_head_stride  = V->ne[0];
+    }
+
+    if (use_bc128) {
+        const int64_t q_r = Q->nb[1] / sizeof(float);
+        const int64_t q_h = Q->nb[2] / sizeof(float);
+        int64_t o_r = 0, o_h = 0;
+        const int heads_q = hkv * gqa;
+        for (int i = 1; i < 4; ++i) {
+            if (dst->ne[i] == (int64_t) heads_q && !o_h) { o_h = dst->nb[i] / sizeof(float); }
+            else if (dst->ne[i] == (int64_t) q_len && !o_r) { o_r = dst->nb[i] / sizeof(float); }
+        }
+        GGML_ASSERT(o_r && o_h);
+        const int64_t mask_kv_stride = (int64_t) (mask->nb[1] / sizeof(half));
+        const half * mask_last_q_b = (const half *) mask->data + (int64_t) (q_len - 1) * mask_kv_stride;
+        if (prefill_bc128_mode == 2 && q_len >= 512) {
+            sm70_prefill96::launch_sm70_prefill_br128_bc128(
+                mask_md, stream,
+                (const float *) Q->data, q_r, q_h,
+                K_h2, V_h2, k_row_stride, k_head_stride, v_row_stride, v_head_stride,
+                (float *) dst->data, o_r, o_h,
+                q_len, kv_len, heads_q, gqa, scale,
+                mask_last_q_b, 1, (const half *) mask->data, mask_kv_stride);
+        } else {
+            sm70_prefill96::launch_sm70_prefill_bc128(
+                mask_md, stream,
+                (const float *) Q->data, q_r, q_h,
+                K_h2, V_h2, k_row_stride, k_head_stride, v_row_stride, v_head_stride,
+                (float *) dst->data, o_r, o_h,
+                q_len, kv_len, heads_q, gqa, scale,
+                mask_last_q_b, 1, (const half *) mask->data, mask_kv_stride);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
 
     // ------------------------------------------------------ stage Q (f32->f16)
